@@ -10,12 +10,13 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 PYTHON_BIN=${PYTHON_BIN:-${RDP_DIR}/.venv/bin/python}
-HF_BIN=${HF_BIN:-${RDP_DIR}/.venv/bin/hf}
 LEROBOT_ROOT=${LEROBOT_ROOT:-/DATA/ljl/substage}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
 DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_rdp_zarr}
 SMOKE_DATASET_PATH=${SMOKE_DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_smoke_rdp_zarr}
 ENCODER_DIR=${ENCODER_DIR:-${RDP_DIR}/data/encoder_ckpt_0809}
+ENCODER_RELEASE_BASE=${ENCODER_RELEASE_BASE:-https://github.com/wjstx0425/RDP_vitamin/releases/download/encoder-0809}
+ENCODER_PARAMS_FILE=params-235cb754d17b461b8be2d652c96fc169.npz
 JAX_PYTHON=${JAX_PYTHON:-${RDP_DIR}/.venv-jax/bin/python}
 OVERWRITE=${OVERWRITE:-0}
 SMOKE_EPISODES=${SMOKE_EPISODES:-1}
@@ -24,7 +25,7 @@ usage() {
   cat <<USAGE
 Usage: $0 <encoder|precompute|validate|convert|smoke>
 
-  encoder    Download the inference-only tactile encoder checkpoint from HF.
+  encoder    Download the inference-only encoder from the GitHub Release.
   precompute Build tactile embeddings using a separate JAX CUDA environment.
   validate   Validate an existing RDP Zarr and load one AT/LDP batch.
   convert    Convert all LeRobot pick_tube_01..04 episodes, then validate.
@@ -37,15 +38,36 @@ Environment variables:
   DATASET_PATH        Full RDP Zarr output/input directory
   JAX_PYTHON          Python from a separate CUDA-enabled JAX environment
   ENCODER_DIR         Downloaded encoder checkpoint directory
+  ENCODER_RELEASE_BASE  Encoder GitHub Release asset URL prefix
   OVERWRITE=1         Replace an existing conversion target
 USAGE
 }
 
 download_encoder() {
-  "${HF_BIN}" download KaiyueChen/encoder_ckpt_0809 \
-    --include checkpoint.json \
-    --include 'params-*.npz' \
-    --local-dir "${ENCODER_DIR}"
+  mkdir -p "${ENCODER_DIR}"
+
+  download_encoder_file() {
+    local filename=$1
+    local expected_sha256=$2
+    local output_path="${ENCODER_DIR}/${filename}"
+
+    if [[ -f "${output_path}" ]] && printf '%s  %s\n' "${expected_sha256}" "${output_path}" | sha256sum --check --status; then
+      echo "Encoder file already verified: ${output_path}"
+      return
+    fi
+
+    curl --fail --location --retry 5 --retry-all-errors \
+      "${ENCODER_RELEASE_BASE}/${filename}" \
+      --output "${output_path}.part"
+    printf '%s  %s\n' "${expected_sha256}" "${output_path}.part" | sha256sum --check --status
+    mv "${output_path}.part" "${output_path}"
+    echo "Downloaded and verified: ${output_path}"
+  }
+
+  download_encoder_file checkpoint.json \
+    aacfdbf6754f749e3516f39cf9c947e77277d35772c5b590d2f285d6c5c477c1
+  download_encoder_file "${ENCODER_PARAMS_FILE}" \
+    a070b4ca6f5fa6a22a73aeae06ce18c22a473bc621d09a5892659cf5c4891797
 }
 
 precompute_tactile() {
