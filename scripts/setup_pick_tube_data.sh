@@ -10,12 +10,15 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 PYTHON_BIN=${PYTHON_BIN:-${RDP_DIR}/.venv/bin/python}
+HF_BIN=${HF_BIN:-${RDP_DIR}/.venv/bin/hf}
+HF_ENDPOINT=${HF_ENDPOINT:-https://alpha.hf-mirror.com}
+HF_MAX_WORKERS=${HF_MAX_WORKERS:-4}
 LEROBOT_ROOT=${LEROBOT_ROOT:-/DATA/ljl/substage}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
 DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_rdp_zarr}
 SMOKE_DATASET_PATH=${SMOKE_DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_smoke_rdp_zarr}
 ENCODER_DIR=${ENCODER_DIR:-${RDP_DIR}/data/encoder_ckpt_0809}
-ENCODER_RELEASE_BASE=${ENCODER_RELEASE_BASE:-https://github.com/wjstx0425/RDP_vitamin/releases/download/encoder-0809}
+ENCODER_RELEASE_BASE=${ENCODER_RELEASE_BASE:-https://alpha.hf-mirror.com/KaiyueChen/encoder_ckpt_0809/resolve/main}
 ENCODER_PARAMS_FILE=params-235cb754d17b461b8be2d652c96fc169.npz
 JAX_PYTHON=${JAX_PYTHON:-${RDP_DIR}/.venv-jax/bin/python}
 OVERWRITE=${OVERWRITE:-0}
@@ -23,9 +26,10 @@ SMOKE_EPISODES=${SMOKE_EPISODES:-1}
 
 usage() {
   cat <<USAGE
-Usage: $0 <encoder|precompute|validate|convert|smoke>
+Usage: $0 <datasets|encoder|precompute|validate|convert|smoke>
 
-  encoder    Download the inference-only encoder from the GitHub Release.
+  datasets   Download LeRobot pick_tube_01..04 from the HF mirror.
+  encoder    Download the inference-only encoder from the HF mirror.
   precompute Build tactile embeddings using a separate JAX CUDA environment.
   validate   Validate an existing RDP Zarr and load one AT/LDP batch.
   convert    Convert all LeRobot pick_tube_01..04 episodes, then validate.
@@ -34,13 +38,28 @@ Usage: $0 <encoder|precompute|validate|convert|smoke>
 Environment variables:
   LEROBOT_ROOT        LeRobot root containing pick_tube_01..04
                       (default: /DATA/ljl/substage)
+  HF_ENDPOINT         Hugging Face endpoint (default: alpha.hf-mirror.com)
+  HF_MAX_WORKERS      Parallel downloads per repository (default: 4)
   TACTILE_CACHE_ROOT  Root containing KaiyueChen/pick_tube_XX/embeddings.npy
   DATASET_PATH        Full RDP Zarr output/input directory
   JAX_PYTHON          Python from a separate CUDA-enabled JAX environment
   ENCODER_DIR         Downloaded encoder checkpoint directory
-  ENCODER_RELEASE_BASE  Encoder GitHub Release asset URL prefix
+  ENCODER_RELEASE_BASE  Encoder download URL prefix
   OVERWRITE=1         Replace an existing conversion target
 USAGE
+}
+
+download_datasets() {
+  mkdir -p "${LEROBOT_ROOT}"
+  for dataset_name in pick_tube_01 pick_tube_02 pick_tube_03 pick_tube_04; do
+    echo "Downloading KaiyueChen/${dataset_name} to ${LEROBOT_ROOT}/${dataset_name}"
+    HF_ENDPOINT="${HF_ENDPOINT}" "${HF_BIN}" download \
+      "KaiyueChen/${dataset_name}" \
+      --repo-type dataset \
+      --local-dir "${LEROBOT_ROOT}/${dataset_name}" \
+      --max-workers "${HF_MAX_WORKERS}"
+    test -f "${LEROBOT_ROOT}/${dataset_name}/meta/info.json"
+  done
 }
 
 download_encoder() {
@@ -140,6 +159,9 @@ convert_dataset() {
 }
 
 case "${COMMAND}" in
+  datasets)
+    download_datasets
+    ;;
   encoder)
     download_encoder
     ;;
