@@ -7,7 +7,7 @@ cd "${RDP_DIR}"
 
 PYTHON_VERSION=${PYTHON_VERSION:-3.12}
 VENV_DIR=${VENV_DIR:-${RDP_DIR}/.venv}
-CUDA_FLAVOR=${CUDA_FLAVOR:-cu128}
+PYPI_INDEX_URL=${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
 TORCH_VERSION=${TORCH_VERSION:-2.10.0}
 TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.25.0}
 TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION:-2.10.0}
@@ -28,29 +28,25 @@ if command -v uv >/dev/null 2>&1; then
   UV_BIN=$(command -v uv)
 else
   UV_BIN=${UV_BIN:-${HOME}/.local/bin/uv}
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    printf '+ curl -LsSf https://astral.sh/uv/install.sh | sh\n'
-  else
-    installer=$(mktemp)
-    curl -LsSf https://astral.sh/uv/install.sh -o "${installer}"
-    sh "${installer}"
-  fi
+  run python3 -m pip install --user \
+    --index-url "${PYPI_INDEX_URL}" uv
 fi
 
 run "${UV_BIN}" venv --python "${PYTHON_VERSION}" "${VENV_DIR}"
 PYTHON_BIN=${VENV_DIR}/bin/python
-TORCH_INDEX_URL=https://download.pytorch.org/whl/${CUDA_FLAVOR}
 run "${UV_BIN}" pip install --python "${PYTHON_BIN}" \
-  --index-url "${TORCH_INDEX_URL}" \
+  --index-url "${PYPI_INDEX_URL}" \
   "torch==${TORCH_VERSION}" \
   "torchvision==${TORCHVISION_VERSION}" \
   "torchaudio==${TORCHAUDIO_VERSION}"
 run "${UV_BIN}" pip install --python "${PYTHON_BIN}" \
+  --index-url "${PYPI_INDEX_URL}" \
   -r requirements-rdp-training.txt
 
 if [[ "${WITH_TACTILE_PRECOMPUTE}" == "1" ]]; then
   run "${UV_BIN}" venv --python "${PYTHON_VERSION}" "${JAX_VENV_DIR}"
   run "${UV_BIN}" pip install --python "${JAX_VENV_DIR}/bin/python" \
+    --index-url "${PYPI_INDEX_URL}" \
     'jax[cuda12]==0.10.2' 'flax==0.12.7' 'numpy==2.5.0' \
     'pyarrow==24.0.0' 'pillow==12.3.0' 'pyyaml==6.0.3'
 fi
