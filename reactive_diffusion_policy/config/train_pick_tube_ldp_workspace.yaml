@@ -1,0 +1,25 @@
+defaults:
+  - train_latent_diffusion_unet_real_image_workspace
+  - override /task: pick_tube_image_tactile_emb_ldp_30fps
+  - override /at: at_pick_tube
+  - _self_
+
+n_action_steps: 10
+n_obs_steps: 1
+dataset_obs_steps: 1
+obs_temporal_downsample_ratio: 1
+dataset_obs_temporal_downsample_ratio: 1
+
+policy:
+  down_dims: [512]
+  obs_encoder:
+    resize_shape: [224, 224]
+    share_rgb_model: false
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 4
