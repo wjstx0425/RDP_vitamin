@@ -12,6 +12,8 @@ fi
 PYTHON_BIN=${PYTHON_BIN:-${RDP_DIR}/.venv/bin/python}
 HF_BIN=${HF_BIN:-${RDP_DIR}/.venv/bin/hf}
 HF_ENDPOINT=${HF_ENDPOINT:-https://alpha.hf-mirror.com}
+HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
+HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-60}
 HF_MAX_WORKERS=${HF_MAX_WORKERS:-4}
 LEROBOT_ROOT=${LEROBOT_ROOT:-/DATA/ljl/substage}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
@@ -39,6 +41,8 @@ Environment variables:
   LEROBOT_ROOT        LeRobot root containing pick_tube_01..04
                       (default: /DATA/ljl/substage)
   HF_ENDPOINT         Hugging Face endpoint (default: alpha.hf-mirror.com)
+  HF_HUB_DISABLE_XET  Disable Xet CAS downloads (default: 1)
+  HF_HUB_DOWNLOAD_TIMEOUT  Per-file HTTP timeout in seconds (default: 60)
   HF_MAX_WORKERS      Parallel downloads per repository (default: 4)
   TACTILE_CACHE_ROOT  Root containing KaiyueChen/pick_tube_XX/embeddings.npy
   DATASET_PATH        Full RDP Zarr output/input directory
@@ -53,7 +57,10 @@ download_datasets() {
   mkdir -p "${LEROBOT_ROOT}"
   for dataset_name in pick_tube_01 pick_tube_02 pick_tube_03 pick_tube_04; do
     echo "Downloading KaiyueChen/${dataset_name} to ${LEROBOT_ROOT}/${dataset_name}"
-    HF_ENDPOINT="${HF_ENDPOINT}" "${HF_BIN}" download \
+    HF_ENDPOINT="${HF_ENDPOINT}" \
+      HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET}" \
+      HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT}" \
+      "${HF_BIN}" download \
       "KaiyueChen/${dataset_name}" \
       --repo-type dataset \
       --local-dir "${LEROBOT_ROOT}/${dataset_name}" \
