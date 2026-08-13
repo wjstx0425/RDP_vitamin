@@ -30,6 +30,7 @@ from reactive_diffusion_policy.model.diffusion.ema_model import EMAModel
 from reactive_diffusion_policy.model.common.lr_scheduler import get_scheduler
 from reactive_diffusion_policy.model.common.lr_decay import param_groups_lrd
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -117,7 +118,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
-        accelerator = Accelerator(log_with='wandb')
+        accelerator = Accelerator(
+            log_with='wandb',
+            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+        )
         wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
         wandb_cfg.pop('project')
         accelerator.init_trackers(
