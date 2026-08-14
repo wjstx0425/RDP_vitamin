@@ -41,7 +41,7 @@ run "${UV_BIN}" pip install --python "${PYTHON_BIN}" \
   "torchaudio==${TORCHAUDIO_VERSION}"
 run "${UV_BIN}" pip install --python "${PYTHON_BIN}" \
   --index-url "${PYPI_INDEX_URL}" \
-  -r requirements-rdp-training.txt
+  -r requirements-rdp-deploy.txt
 
 if [[ "${WITH_TACTILE_PRECOMPUTE}" == "1" ]]; then
   run "${UV_BIN}" venv --python "${PYTHON_VERSION}" "${JAX_VENV_DIR}"

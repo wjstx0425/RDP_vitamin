@@ -15,6 +15,9 @@ HF_ENDPOINT=${HF_ENDPOINT:-https://alpha.hf-mirror.com}
 HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
 HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-60}
 HF_MAX_WORKERS=${HF_MAX_WORKERS:-4}
+RDP_MODEL_REPO=${RDP_MODEL_REPO:-wjstx/rdp}
+RDP_MODEL_REVISION=${RDP_MODEL_REVISION:-main}
+RDP_WEIGHTS_DIR=${RDP_WEIGHTS_DIR:-${RDP_DIR}/data/weights/wjstx_rdp}
 LEROBOT_ROOT=${LEROBOT_ROOT:-/DATA/ljl/substage}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
 DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_rdp_zarr}
@@ -28,10 +31,11 @@ SMOKE_EPISODES=${SMOKE_EPISODES:-1}
 
 usage() {
   cat <<USAGE
-Usage: $0 <datasets|encoder|precompute|validate|convert|smoke>
+Usage: $0 <datasets|encoder|weights|precompute|validate|convert|smoke>
 
   datasets   Download LeRobot pick_tube_01..04 from the HF mirror.
   encoder    Download the inference-only encoder from the HF mirror.
+  weights    Download latest AT/LDP deployment checkpoints from wjstx/rdp.
   precompute Build tactile embeddings using a separate JAX CUDA environment.
   validate   Validate an existing RDP Zarr and load one AT/LDP batch.
   convert    Convert all LeRobot pick_tube_01..04 episodes, then validate.
@@ -44,6 +48,9 @@ Environment variables:
   HF_HUB_DISABLE_XET  Disable Xet CAS downloads (default: 1)
   HF_HUB_DOWNLOAD_TIMEOUT  Per-file HTTP timeout in seconds (default: 60)
   HF_MAX_WORKERS      Parallel downloads per repository (default: 4)
+  RDP_MODEL_REPO      RDP checkpoint repository (default: wjstx/rdp)
+  RDP_MODEL_REVISION  Repository revision (default: main)
+  RDP_WEIGHTS_DIR     Local checkpoint directory
   TACTILE_CACHE_ROOT  Root containing KaiyueChen/pick_tube_XX/embeddings.npy
   DATASET_PATH        Full RDP Zarr output/input directory
   JAX_PYTHON          Python from a separate CUDA-enabled JAX environment
@@ -94,6 +101,23 @@ download_encoder() {
     aacfdbf6754f749e3516f39cf9c947e77277d35772c5b590d2f285d6c5c477c1
   download_encoder_file "${ENCODER_PARAMS_FILE}" \
     a070b4ca6f5fa6a22a73aeae06ce18c22a473bc621d09a5892659cf5c4891797
+}
+
+download_rdp_weights() {
+  mkdir -p "${RDP_WEIGHTS_DIR}"
+  HF_ENDPOINT="${HF_ENDPOINT}" \
+    HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET}" \
+    HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT}" \
+    "${HF_BIN}" download \
+    "${RDP_MODEL_REPO}" \
+    --revision "${RDP_MODEL_REVISION}" \
+    --include '*/checkpoints/latest.ckpt' \
+    --include '*/.hydra/*.yaml' \
+    --include '*/normalizer.pkl' \
+    --local-dir "${RDP_WEIGHTS_DIR}" \
+    --max-workers "${HF_MAX_WORKERS}"
+  echo "Downloaded deployment checkpoints:"
+  find "${RDP_WEIGHTS_DIR}" -path '*/checkpoints/latest.ckpt' -type f -print
 }
 
 precompute_tactile() {
@@ -171,6 +195,9 @@ case "${COMMAND}" in
     ;;
   encoder)
     download_encoder
+    ;;
+  weights)
+    download_rdp_weights
     ;;
   precompute)
     precompute_tactile "$@"
