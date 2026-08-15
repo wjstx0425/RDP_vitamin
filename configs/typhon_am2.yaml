@@ -1,0 +1,28 @@
+urdf_path_left: real_world/robot_api/assets/AM2_left.urdf
+urdf_path_right: real_world/robot_api/assets/AM2_right.urdf
+base_link_left: base_link
+base_link_right: base_link
+ee_link_left: left-link_arm_7
+ee_link_right: right-link_arm_7
+
+left_joint_names:
+  - left-joint_arm_1
+  - left-joint_arm_2
+  - left-joint_arm_3
+  - left-joint_arm_4
+  - left-joint_arm_5
+  - left-joint_arm_6
+  - left-joint_arm_7
+right_joint_names:
+  - right-joint_arm_1
+  - right-joint_arm_2
+  - right-joint_arm_3
+  - right-joint_arm_4
+  - right-joint_arm_5
+  - right-joint_arm_6
+  - right-joint_arm_7
+
+typhon:
+  base_url: http://192.168.100.100:8081
+  timeout: 5.0
+  auto_enter_control_mode: true
