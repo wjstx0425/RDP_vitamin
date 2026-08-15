@@ -22,6 +22,8 @@ action_horizon=1
 steps_per_inference=1
 ```
 
+For offline responsibility assignment, training-data checks, and safe replay commands, see [the 2026-08-15 pick-tube RDP debug runbook](docs/rdp_pick_tube_debug_runbook_20260815.md).
+
 Compared with the SmolVLA path, the server publishes 224×224 observations and
 schedules each returned action from receive time with a 50 ms lead. It still
 uses the existing 20D state constructor, per-arm relative-action integration,
