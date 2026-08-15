@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import suppress
 import threading
 import time
 from typing import Any
@@ -57,6 +58,67 @@ class RobotClient:
         self._next_connection_generation = 0
         self._active_connection_generations: set[int] = set()
 
+    def _send_outbound(
+        self,
+        websocket: ServerConnection,
+        connection_generation: int,
+        connection_done: threading.Event,
+        sender_errors: list[BaseException],
+    ) -> None:
+        last_sent_obs_seq = -1
+        last_sent_action_ack_obs_seq = -1
+        initiated_shutdown = False
+
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(
+                        lambda: self._stopped
+                        or connection_done.is_set()
+                        or (
+                            self._latest_action_ack is not None
+                            and self._latest_action_ack_generation
+                            == connection_generation
+                            and int(self._latest_action_ack["obs_seq"])
+                            > last_sent_action_ack_obs_seq
+                        )
+                        or (
+                            self._latest_obs is not None
+                            and self._latest_obs_seq > last_sent_obs_seq
+                        )
+                    )
+                    if self._stopped or connection_done.is_set():
+                        initiated_shutdown = self._stopped
+                        break
+                    if (
+                        self._latest_action_ack is not None
+                        and self._latest_action_ack_generation
+                        == connection_generation
+                        and int(self._latest_action_ack["obs_seq"])
+                        > last_sent_action_ack_obs_seq
+                    ):
+                        outbound = self._latest_action_ack
+                    else:
+                        outbound = self._latest_obs
+
+                websocket.send(self._packer.pack(outbound))
+                if outbound["type"] == "action_ack":
+                    last_sent_action_ack_obs_seq = int(outbound["obs_seq"])
+                else:
+                    last_sent_obs_seq = int(outbound["obs_seq"])
+        except ConnectionClosed:
+            pass
+        except BaseException as exc:
+            sender_errors.append(exc)
+            initiated_shutdown = True
+        finally:
+            connection_done.set()
+            with self._condition:
+                self._condition.notify_all()
+            if initiated_shutdown:
+                with suppress(ConnectionClosed):
+                    websocket.close()
+
     def _process_request(self, connection: ServerConnection, request: Request) -> Response | None:
         del connection
 
@@ -91,8 +153,10 @@ class RobotClient:
             self._connected = True
             self._condition.notify_all()
 
-        last_sent_obs_seq = -1
-        last_sent_action_ack_obs_seq = -1
+        connection_done = threading.Event()
+        sender_errors: list[BaseException] = []
+        sender_thread: threading.Thread | None = None
+        receive_error: BaseException | None = None
 
         try:
             websocket.send(
@@ -103,33 +167,21 @@ class RobotClient:
                     }
                 )
             )
+            sender_thread = threading.Thread(
+                target=self._send_outbound,
+                args=(
+                    websocket,
+                    connection_generation,
+                    connection_done,
+                    sender_errors,
+                ),
+                name=f"RobotClientSender-{self.port}-{connection_generation}",
+                daemon=True,
+            )
+            sender_thread.start()
 
             while True:
-                outbound = None
-                with self._condition:
-                    if self._stopped:
-                        break
-                    if (
-                        self._latest_action_ack is not None
-                        and self._latest_action_ack_generation == connection_generation
-                        and int(self._latest_action_ack["obs_seq"]) > last_sent_action_ack_obs_seq
-                    ):
-                        outbound = self._latest_action_ack
-                    elif self._latest_obs is not None and self._latest_obs_seq > last_sent_obs_seq:
-                        outbound = self._latest_obs
-
-                if outbound is not None:
-                    websocket.send(self._packer.pack(outbound))
-                    if outbound["type"] == "action_ack":
-                        last_sent_action_ack_obs_seq = int(outbound["obs_seq"])
-                    else:
-                        last_sent_obs_seq = int(outbound["obs_seq"])
-
-                try:
-                    raw_message = websocket.recv(timeout=0.05)
-                except TimeoutError:
-                    continue
-
+                raw_message = websocket.recv()
                 if isinstance(raw_message, str):
                     raise RuntimeError("Robot bridge expects binary websocket frames.")
 
@@ -137,7 +189,18 @@ class RobotClient:
                 self._handle_message(message, connection_generation)
         except ConnectionClosed:
             pass
+        except BaseException as exc:
+            receive_error = exc
         finally:
+            connection_done.set()
+            with self._condition:
+                self._condition.notify_all()
+
+            sender_stuck = False
+            if sender_thread is not None:
+                sender_thread.join(timeout=1.0)
+                sender_stuck = sender_thread.is_alive()
+
             with self._condition:
                 self._active_connection_generations.discard(connection_generation)
                 self._connected = bool(self._active_connection_generations)
@@ -146,6 +209,13 @@ class RobotClient:
                     self._latest_action_obs_seq = -1
                     self._latest_action_generation = None
                 self._condition.notify_all()
+
+        if receive_error is not None:
+            raise receive_error
+        if sender_stuck:
+            raise RuntimeError("Robot bridge sender thread did not stop")
+        if sender_errors:
+            raise sender_errors[0]
 
     def _handle_message(self, message: dict[str, Any], connection_generation: int) -> None:
         message_type = message.get("type")

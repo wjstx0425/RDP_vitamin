@@ -240,6 +240,7 @@ class FakeWebSocket:
         self.events = []
         self.action_returned = False
         self.published = False
+        self.close_requested = threading.Event()
 
     def send(self, payload) -> None:
         message = msgpack_numpy.unpackb(payload)
@@ -248,7 +249,7 @@ class FakeWebSocket:
             self.client.stop()
 
     def recv(self, timeout=None):
-        assert timeout == 0.05
+        assert timeout is None
         if not self.action_returned:
             self.action_returned = True
             return msgpack_numpy.packb(
@@ -268,7 +269,91 @@ class FakeWebSocket:
             self.client.publish_action_ack(7)
             if self.stop_after_publish:
                 self.client.stop()
-        raise TimeoutError
+        self.close_requested.wait()
+        raise ConnectionClosedOK(None, None)
+
+    def close(self) -> None:
+        self.close_requested.set()
+
+
+class BlockingReceiveWebSocket:
+    def __init__(self, action_obs_seq=None) -> None:
+        self.action_obs_seq = action_obs_seq
+        self.action_returned = False
+        self.hello_sent = threading.Event()
+        self.receive_blocked = threading.Event()
+        self.observation_sent = threading.Event()
+        self.ack_sent = threading.Event()
+        self.close_requested = threading.Event()
+        self.sent = []
+
+    def send(self, payload) -> None:
+        message = msgpack_numpy.unpackb(payload)
+        self.sent.append(message)
+        if message["type"] == "hello":
+            self.hello_sent.set()
+        elif message["type"] == "obs":
+            self.observation_sent.set()
+        elif message["type"] == "action_ack":
+            self.ack_sent.set()
+
+    def recv(self, timeout=None):
+        del timeout
+        if self.action_obs_seq is not None and not self.action_returned:
+            self.action_returned = True
+            return msgpack_numpy.packb(
+                {
+                    "type": "action",
+                    "obs_seq": self.action_obs_seq,
+                    "action": np.array([[self.action_obs_seq]], dtype=np.float32),
+                }
+            )
+        self.receive_blocked.set()
+        self.close_requested.wait()
+        raise ConnectionClosedOK(None, None)
+
+    def close(self) -> None:
+        self.close_requested.set()
+
+
+def test_robot_client_sends_observation_while_receive_is_blocked() -> None:
+    client = RobotClient()
+    websocket = BlockingReceiveWebSocket()
+    handler = threading.Thread(
+        target=client._handle_connection, args=(websocket,), daemon=True
+    )
+    handler.start()
+    try:
+        assert websocket.hello_sent.wait(timeout=1.0)
+        assert websocket.receive_blocked.wait(timeout=1.0)
+        client.publish_obs({"value": 7})
+        assert websocket.observation_sent.wait(timeout=0.2)
+    finally:
+        websocket.close()
+        handler.join(timeout=1.0)
+    assert not handler.is_alive()
+
+
+def test_robot_client_sends_ack_while_receive_is_blocked() -> None:
+    client = RobotClient()
+    client.enable_action_ack()
+    websocket = BlockingReceiveWebSocket(action_obs_seq=7)
+    handler = threading.Thread(
+        target=client._handle_connection, args=(websocket,), daemon=True
+    )
+    handler.start()
+    try:
+        np.testing.assert_array_equal(
+            client.wait_for_action(obs_seq=7, timeout=1.0),
+            np.array([[7]], dtype=np.float32),
+        )
+        assert websocket.receive_blocked.wait(timeout=1.0)
+        client.publish_action_ack(7)
+        assert websocket.ack_sent.wait(timeout=0.2)
+    finally:
+        websocket.close()
+        handler.join(timeout=1.0)
+    assert not handler.is_alive()
 
 
 def test_robot_client_emits_ack_only_after_publish_with_exact_sequence() -> None:
@@ -392,7 +477,7 @@ class GenerationWebSocket:
             self.hello_sent.set()
 
     def recv(self, timeout=None):
-        assert timeout == 0.05
+        assert timeout is None
         if (
             self.action_obs_seq is not None
             and self.action_enabled.is_set()
@@ -406,11 +491,11 @@ class GenerationWebSocket:
                     "action": np.array([[self.action_obs_seq]], dtype=np.float32),
                 }
             )
-        if self.ack_published.is_set():
-            self.polled_after_ack.set()
-        if self.close_requested.is_set():
-            raise ConnectionClosedOK(None, None)
-        raise TimeoutError
+        self.close_requested.wait()
+        raise ConnectionClosedOK(None, None)
+
+    def close(self) -> None:
+        self.close_requested.set()
 
 
 def test_late_ack_from_disconnected_connection_is_not_sent_to_replacement() -> None:
