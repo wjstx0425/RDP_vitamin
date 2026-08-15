@@ -34,7 +34,6 @@ class RobotClient:
         self._allowed_tokens = None if allowed_tokens is None else {str(token) for token in allowed_tokens}
 
         self._condition = threading.Condition()
-        self._packer = msgpack_numpy.Packer()
         self._server: Server | None = None
         self._thread: threading.Thread | None = None
         self._stopped = False
@@ -61,6 +60,7 @@ class RobotClient:
     def _send_outbound(
         self,
         websocket: ServerConnection,
+        packer: Any,
         connection_generation: int,
         connection_done: threading.Event,
         sender_errors: list[BaseException],
@@ -101,7 +101,7 @@ class RobotClient:
                     else:
                         outbound = self._latest_obs
 
-                websocket.send(self._packer.pack(outbound))
+                websocket.send(packer.pack(outbound))
                 if outbound["type"] == "action_ack":
                     last_sent_action_ack_obs_seq = int(outbound["obs_seq"])
                 else:
@@ -157,10 +157,12 @@ class RobotClient:
         sender_errors: list[BaseException] = []
         sender_thread: threading.Thread | None = None
         receive_error: BaseException | None = None
+        close_error: BaseException | None = None
 
         try:
+            packer = msgpack_numpy.Packer()
             websocket.send(
-                self._packer.pack(
+                packer.pack(
                     {
                         "type": "hello",
                         "protocol": "robot-bridge-v1",
@@ -171,6 +173,7 @@ class RobotClient:
                 target=self._send_outbound,
                 args=(
                     websocket,
+                    packer,
                     connection_generation,
                     connection_done,
                     sender_errors,
@@ -196,6 +199,13 @@ class RobotClient:
             with self._condition:
                 self._condition.notify_all()
 
+            try:
+                websocket.close()
+            except ConnectionClosed:
+                pass
+            except BaseException as exc:
+                close_error = exc
+
             sender_stuck = False
             if sender_thread is not None:
                 sender_thread.join(timeout=1.0)
@@ -210,12 +220,17 @@ class RobotClient:
                     self._latest_action_generation = None
                 self._condition.notify_all()
 
+        if sender_stuck:
+            sender_stuck_error = RuntimeError(
+                "Robot bridge sender thread did not stop after closing the connection"
+            )
+            raise sender_stuck_error from receive_error or close_error
         if receive_error is not None:
             raise receive_error
-        if sender_stuck:
-            raise RuntimeError("Robot bridge sender thread did not stop")
         if sender_errors:
             raise sender_errors[0]
+        if close_error is not None:
+            raise close_error
 
     def _handle_message(self, message: dict[str, Any], connection_generation: int) -> None:
         message_type = message.get("type")

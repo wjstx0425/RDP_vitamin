@@ -325,6 +325,44 @@ class BlockingReceiveWebSocket:
         self.close_requested.set()
 
 
+class BlockingSendWebSocket:
+    def __init__(self) -> None:
+        self.hello_sent = threading.Event()
+        self.receive_blocked = threading.Event()
+        self.disconnect_requested = threading.Event()
+        self.send_blocked = threading.Event()
+        self.close_requested = threading.Event()
+        self.close_calls = 0
+
+    def send(self, payload) -> None:
+        message = msgpack_numpy.unpackb(payload)
+        if message["type"] == "hello":
+            self.hello_sent.set()
+            return
+        self.send_blocked.set()
+        self.close_requested.wait()
+        raise ConnectionClosedOK(None, None)
+
+    def recv(self, timeout=None):
+        assert timeout is None
+        self.receive_blocked.set()
+        self.disconnect_requested.wait()
+        raise ConnectionClosedOK(None, None)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.close_requested.set()
+
+
+class FailingSendWebSocket(BlockingReceiveWebSocket):
+    def send(self, payload) -> None:
+        message = msgpack_numpy.unpackb(payload)
+        if message["type"] == "hello":
+            self.hello_sent.set()
+            return
+        raise RuntimeError("synthetic sender failure")
+
+
 def test_robot_client_sends_observation_while_receive_is_blocked() -> None:
     client = RobotClient()
     websocket = BlockingReceiveWebSocket()
@@ -363,6 +401,59 @@ def test_robot_client_sends_ack_while_receive_is_blocked() -> None:
         websocket.close()
         handler.join(timeout=1.0)
     assert not handler.is_alive()
+
+
+def test_robot_client_closes_socket_before_joining_blocked_sender() -> None:
+    client = RobotClient()
+    websocket = BlockingSendWebSocket()
+    handler_errors = []
+
+    def handle_connection() -> None:
+        try:
+            client._handle_connection(websocket)
+        except BaseException as exc:
+            handler_errors.append(exc)
+
+    handler = threading.Thread(target=handle_connection, daemon=True)
+    handler.start()
+    try:
+        assert websocket.hello_sent.wait(timeout=1.0)
+        assert websocket.receive_blocked.wait(timeout=1.0)
+        client.publish_obs({"value": 7})
+        assert websocket.send_blocked.wait(timeout=1.0)
+        websocket.disconnect_requested.set()
+        handler.join(timeout=1.5)
+
+        assert websocket.close_calls >= 1
+        assert not handler.is_alive()
+        assert handler_errors == []
+    finally:
+        websocket.close()
+        handler.join(timeout=1.0)
+
+
+def test_robot_client_surfaces_unexpected_sender_failure() -> None:
+    client = RobotClient()
+    websocket = FailingSendWebSocket()
+    handler_errors = []
+
+    def handle_connection() -> None:
+        try:
+            client._handle_connection(websocket)
+        except BaseException as exc:
+            handler_errors.append(exc)
+
+    handler = threading.Thread(target=handle_connection, daemon=True)
+    handler.start()
+    assert websocket.hello_sent.wait(timeout=1.0)
+    assert websocket.receive_blocked.wait(timeout=1.0)
+    client.publish_obs({"value": 7})
+    handler.join(timeout=1.0)
+
+    assert not handler.is_alive()
+    assert len(handler_errors) == 1
+    assert isinstance(handler_errors[0], RuntimeError)
+    assert str(handler_errors[0]) == "synthetic sender failure"
 
 
 def test_robot_client_emits_ack_only_after_publish_with_exact_sequence() -> None:
@@ -559,15 +650,76 @@ def test_old_connection_shutdown_does_not_mark_replacement_disconnected() -> Non
     assert client.is_connected() is False
 
 
+def test_overlapping_connections_pack_messages_independently(monkeypatch) -> None:
+    rendezvous = threading.Barrier(2)
+
+    class NonThreadSafePacker:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._packing = False
+
+        def pack(self, message):
+            with self._lock:
+                if self._packing:
+                    raise RuntimeError("packer reused concurrently")
+                self._packing = True
+            try:
+                rendezvous.wait(timeout=1.0)
+                return msgpack_numpy.packb(message)
+            finally:
+                with self._lock:
+                    self._packing = False
+
+    monkeypatch.setattr(msgpack_numpy, "Packer", NonThreadSafePacker)
+    client = RobotClient()
+    connection_a = GenerationWebSocket()
+    connection_b = GenerationWebSocket()
+    handler_errors = []
+
+    def handle_connection(websocket) -> None:
+        try:
+            client._handle_connection(websocket)
+        except BaseException as exc:
+            handler_errors.append(exc)
+
+    thread_a = threading.Thread(
+        target=handle_connection, args=(connection_a,), daemon=True
+    )
+    thread_b = threading.Thread(
+        target=handle_connection, args=(connection_b,), daemon=True
+    )
+    thread_a.start()
+    thread_b.start()
+    try:
+        assert connection_a.hello_sent.wait(timeout=1.5)
+        assert connection_b.hello_sent.wait(timeout=1.5)
+    finally:
+        connection_a.close()
+        connection_b.close()
+        thread_a.join(timeout=1.0)
+        thread_b.join(timeout=1.0)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert handler_errors == []
+
+
 def test_robot_bridge_localhost_cycle_p95_is_below_15_ms() -> None:
     port = get_unused_loopback_port()
     server = RobotClient(host="127.0.0.1", port=port)
     server.enable_action_ack()
-    server.start_background()
+    server_thread = server.start_background()
     remote = None
     cycle_ms = []
 
     try:
+        with server._condition:  # noqa: SLF001
+            server_started = server._condition.wait_for(  # noqa: SLF001
+                lambda: server._server is not None or not server_thread.is_alive(),  # noqa: SLF001
+                timeout=1.0,
+            )
+            assert server_started
+            assert server._server is not None  # noqa: SLF001
         remote = InterfaceClient(ip="127.0.0.1", port=port)
         assert server.wait_for_connection(timeout=1.0)
 
@@ -593,6 +745,7 @@ def test_robot_bridge_localhost_cycle_p95_is_below_15_ms() -> None:
         server.stop()
         server.join(timeout=2.0)
 
+    assert not server_thread.is_alive()
     p95_ms = float(np.percentile(cycle_ms, 95))
     assert p95_ms < 15.0, f"localhost bridge p95 was {p95_ms:.3f} ms: {cycle_ms}"
 
