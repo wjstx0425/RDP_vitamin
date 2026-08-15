@@ -38,6 +38,7 @@ tools/analyze_bad_mjpg.py
 
 .agents/
 .superpowers/
+.worktrees/
 .vscode/
 .idea/
 .DS_Store
