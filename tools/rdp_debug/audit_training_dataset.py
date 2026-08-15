@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,7 @@ ACTION_DIM = 20
 ARM_ACTION_DIM = 10
 STATE_XYZ_OFFSETS = {"left": 0, "right": 7}
 IDENTITY_ROT6D = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+ACTION_ARM_MAPPING = {"left": "[0:10]", "right": "[10:20]"}
 
 
 @dataclass(frozen=True)
@@ -32,8 +34,8 @@ def validate_arrays(action: np.ndarray, state: np.ndarray, episode_ends: np.ndar
     ends_value = np.asarray(episode_ends)
     if action_value.ndim != 2 or action_value.shape[1] != ACTION_DIM:
         raise ValueError(f"{source}: expected action shape (frames, {ACTION_DIM}), got {action_value.shape}")
-    if state_value.ndim != 2 or state_value.shape[0] != action_value.shape[0] or state_value.shape[1] < 10:
-        raise ValueError(f"{source}: expected state shape (frames, >=10), got {state_value.shape}")
+    if state_value.ndim != 2 or state_value.shape != action_value.shape:
+        raise ValueError(f"{source}: expected state shape (frames, {ACTION_DIM}), got {state_value.shape}")
     if not np.isfinite(action_value).all() or not np.isfinite(state_value).all():
         raise ValueError(f"{source}: action and state must contain only finite values")
     if ends_value.ndim != 1 or not ends_value.size:
@@ -71,7 +73,7 @@ def load_lerobot(path: Path) -> DatasetArrays:
     states: list[np.ndarray] = []
     ends: list[int] = []
     total = 0
-    for parquet in sorted((path / "data").glob("chunk-*/episode_*.parquet")):
+    for parquet in sorted((path / "data").glob("chunk-*/episode_*.parquet"), key=_lerobot_episode_key):
         table = pq.read_table(parquet, columns=["actions", "observation.state"])
         action = np.asarray(table["actions"].to_pylist(), dtype=np.float64)
         state = np.asarray(table["observation.state"].to_pylist(), dtype=np.float64)
@@ -82,6 +84,14 @@ def load_lerobot(path: Path) -> DatasetArrays:
     if not actions:
         raise FileNotFoundError(f"{path}: no data/chunk-*/episode_*.parquet files")
     return validate_arrays(np.concatenate(actions), np.concatenate(states), np.asarray(ends), path)
+
+
+def _lerobot_episode_key(parquet: Path) -> tuple[int, int]:
+    chunk_match = re.fullmatch(r"chunk-(\d+)", parquet.parent.name)
+    episode_match = re.fullmatch(r"episode_(\d+)\.parquet", parquet.name)
+    if chunk_match is None or episode_match is None:
+        raise ValueError(f"{parquet}: expected chunk-<number>/episode_<number>.parquet")
+    return int(chunk_match.group(1)), int(episode_match.group(1))
 
 
 def load_dataset(path: Path, source_format: str = "auto") -> DatasetArrays:
@@ -170,7 +180,7 @@ def _side_metrics(action: np.ndarray, side: str) -> dict[str, Any]:
     rotation = action[:, offset + 3 : offset + 9]
     gripper = action[:, offset + 9]
     return {
-        "position_rms_mm_per_step": float(np.sqrt(np.mean(np.square(position))) * 1000.0),
+        "position_rms_mm_per_step": float(np.sqrt(np.mean(np.sum(np.square(position), axis=1))) * 1000.0),
         "rot6d_residual_to_identity_rms": float(np.sqrt(np.mean(np.square(rotation - IDENTITY_ROT6D)))),
         "gripper": {
             "min": float(np.min(gripper)),
@@ -201,7 +211,7 @@ def audit_dataset(
     data = validate_arrays(data.action, data.state, data.episode_ends, Path("dataset"))
     if not start_windows or any(isinstance(window, bool) or not isinstance(window, int) or window < 1 for window in start_windows):
         raise ValueError("start_windows must contain positive integers")
-    if not np.isfinite(movement_threshold) or movement_threshold < 0.0:
+    if isinstance(movement_threshold, (bool, np.bool_)) or not np.isfinite(movement_threshold) or movement_threshold < 0.0:
         raise ValueError("movement_threshold must be a finite non-negative number")
 
     episodes: list[dict[str, Any]] = []
@@ -219,6 +229,7 @@ def audit_dataset(
 
     return {
         "frames": int(len(data.action)),
+        "action_arm_mapping": dict(ACTION_ARM_MAPPING),
         "schema": {
             "action_shape": list(data.action.shape),
             "state_shape": list(data.state.shape),
