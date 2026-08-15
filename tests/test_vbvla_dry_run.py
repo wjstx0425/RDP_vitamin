@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import deque
+import socket
 import threading
+import time
 
 from click.testing import CliRunner
 import numpy as np
@@ -9,6 +11,7 @@ import pytest
 from websockets.exceptions import ConnectionClosedOK
 
 from client import msgpack_numpy
+from client.interface_client import InterfaceClient
 from client.robot_client import RobotClient
 
 TASK = "fold the towel"
@@ -32,6 +35,12 @@ def make_valid_action(action_horizon: int = 2, n_robots: int = 2) -> np.ndarray:
     action[..., 7] = 1.0
     action[..., 9] = 0.5
     return action.reshape(action_horizon, n_robots * 10)
+
+
+def get_unused_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 class FakeProtocolClient:
@@ -548,6 +557,44 @@ def test_old_connection_shutdown_does_not_mark_replacement_disconnected() -> Non
     assert not thread_b.is_alive()
     assert connected_while_replacement_active is True
     assert client.is_connected() is False
+
+
+def test_robot_bridge_localhost_cycle_p95_is_below_15_ms() -> None:
+    port = get_unused_loopback_port()
+    server = RobotClient(host="127.0.0.1", port=port)
+    server.enable_action_ack()
+    server.start_background()
+    remote = None
+    cycle_ms = []
+
+    try:
+        remote = InterfaceClient(ip="127.0.0.1", port=port)
+        assert server.wait_for_connection(timeout=1.0)
+
+        for value in range(50):
+            started = time.perf_counter()
+            obs_seq = server.publish_obs({"value": value})
+            received_seq, received_obs = remote.recv_obs(timeout=1.0)
+            assert received_seq == obs_seq
+            assert received_obs == {"value": value}
+
+            action = np.array([[value]], dtype=np.float32)
+            remote.send_action(action, obs_seq)
+            np.testing.assert_array_equal(
+                server.wait_for_action(obs_seq, timeout=1.0), action
+            )
+            server.publish_action_ack(obs_seq)
+            ack = remote._recv_message(timeout=1.0)  # noqa: SLF001
+            assert ack == {"type": "action_ack", "obs_seq": obs_seq}
+            cycle_ms.append((time.perf_counter() - started) * 1000.0)
+    finally:
+        if remote is not None:
+            remote.close()
+        server.stop()
+        server.join(timeout=2.0)
+
+    p95_ms = float(np.percentile(cycle_ms, 95))
+    assert p95_ms < 15.0, f"localhost bridge p95 was {p95_ms:.3f} ms: {cycle_ms}"
 
 
 def test_real_action_ack_is_published_only_after_successful_execution(monkeypatch) -> None:
