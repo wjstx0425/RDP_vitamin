@@ -15,8 +15,6 @@ htmlcov/
 .codex
 
 token_list.txt
-quest_2_ee_*.npy
-real_world/robot_api/assets/
 
 *.log
 ee_action_logs/

@@ -1,5 +1,4 @@
 # VB3 Robot Server
-> **Deployment assets:** This branch intentionally excludes robot-specific `quest_2_ee_*.npy` hand-eye calibration files and `real_world/robot_api/assets/`. Before hardware startup, copy the calibration and URDF/mesh assets from the existing `vb3_robot_server` installation on the robot computer. Do not reuse calibration files across different robots.
 
 ## 系统结构
 
