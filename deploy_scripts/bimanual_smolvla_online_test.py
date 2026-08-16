@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import subprocess
 import types
 from pathlib import Path
@@ -108,6 +109,67 @@ def call_main(**updates):
         "action_timeout_s": 30.0,
     }
     return smolvla.main.callback(**(kwargs | updates))
+
+
+def test_deployment_snapshot_saves_lossless_rgb_png_and_manifest(tmp_path):
+    image = np.array(
+        [[[255, 0, 0], [0, 255, 0], [0, 0, 255]]],
+        dtype=np.uint8,
+    )
+    observation = {"observation.images.camera0": image}
+
+    snapshot_dir = smolvla.save_deployment_image_snapshot(
+        observation,
+        tmp_path,
+        policy_type="rdp",
+        data_type="vitac",
+        now=smolvla.datetime(2026, 8, 16, 12, 34, 56, 789000),
+    )
+
+    saved_bgr = smolvla.cv2.imread(
+        str(snapshot_dir / "observation.images.camera0.png"),
+        smolvla.cv2.IMREAD_COLOR,
+    )
+    saved_rgb = smolvla.cv2.cvtColor(saved_bgr, smolvla.cv2.COLOR_BGR2RGB)
+    np.testing.assert_array_equal(saved_rgb, image)
+    manifest = json.loads((snapshot_dir / "manifest.json").read_text())
+    assert manifest["policy_type"] == "rdp"
+    assert manifest["data_type"] == "vitac"
+    assert manifest["images"]["observation.images.camera0"] == {
+        "filename": "observation.images.camera0.png",
+        "shape": [1, 3, 3],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+    }
+
+
+@pytest.mark.parametrize(
+    ("observation", "match"),
+    [
+        (
+            {"observation.images.camera0": np.zeros((2, 3, 3), dtype=np.float32)},
+            r"camera0.*uint8",
+        ),
+        (
+            {"observation.images.camera0": np.zeros((2, 3), dtype=np.uint8)},
+            r"camera0.*HWC",
+        ),
+        ({"observation.state": np.zeros(20)}, "no image keys"),
+    ],
+)
+def test_deployment_snapshot_rejects_invalid_observations(
+    tmp_path,
+    observation,
+    match,
+):
+    with pytest.raises(ValueError, match=match):
+        smolvla.save_deployment_image_snapshot(
+            observation,
+            tmp_path,
+            policy_type="rdp",
+            data_type="vitac",
+        )
 
 
 def test_cli_does_not_expose_removed_control_options():

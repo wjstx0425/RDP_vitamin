@@ -407,6 +407,61 @@ def load_token_list(token_file: str) -> list[str]:
     return token_list
 
 
+def save_deployment_image_snapshot(
+    observation: dict,
+    output_root: Path,
+    *,
+    policy_type: str,
+    data_type: str,
+    now: datetime | None = None,
+) -> Path:
+    """Save exact pre-publication RGB observations as lossless PNG files."""
+    image_keys = sorted(
+        key for key in observation if key.startswith("observation.images.")
+    )
+    if not image_keys:
+        raise ValueError("deployment snapshot observation has no image keys")
+
+    captured_at = now or datetime.now()
+    snapshot_dir = Path(output_root) / (
+        "deploy_snapshot_" + captured_at.strftime("%Y%m%d_%H%M%S_%f")
+    )
+    snapshot_dir.mkdir(parents=True, exist_ok=False)
+    image_manifest = {}
+
+    for key in image_keys:
+        image = np.asarray(observation[key])
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError(f"{key} must be HWC RGB, got {image.shape}")
+        if image.dtype != np.uint8:
+            raise ValueError(f"{key} must be uint8 RGB, got {image.dtype}")
+
+        filename = f"{key}.png"
+        output_path = snapshot_dir / filename
+        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        if not cv2.imwrite(str(output_path), image_bgr):
+            raise OSError(
+                f"failed to write deployment snapshot: {output_path.resolve()}"
+            )
+        image_manifest[key] = {
+            "filename": filename,
+            "shape": list(image.shape),
+            "dtype": str(image.dtype),
+            "min": int(image.min()),
+            "max": int(image.max()),
+        }
+
+    manifest = {
+        "captured_at": captured_at.isoformat(),
+        "policy_type": policy_type,
+        "data_type": data_type,
+        "images": image_manifest,
+    }
+    with (snapshot_dir / "manifest.json").open("w", encoding="utf-8") as file:
+        json.dump(manifest, file, indent=2, sort_keys=True)
+    return snapshot_dir.resolve()
+
+
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
 
