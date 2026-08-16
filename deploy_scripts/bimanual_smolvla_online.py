@@ -28,6 +28,11 @@ from utils.precise_sleep import precise_wait
 from utils.pose_util import mat_to_pose, pose10d_to_pose_col
 from real_world.real_inference_util import get_real_umi_obs_dict, get_real_umi_action
 from deploy_scripts.vbvla_dry_run import run_dry_run
+from deploy_scripts.deployment_trial_recorder import (
+    DeploymentTrialRecorder,
+    decode_relative_actions,
+    extract_robot_poses,
+)
 from deploy_scripts.vbvla_safety import (
     ActionTimeout,
     ClientDisconnected,
@@ -367,6 +372,18 @@ def _stop_robot_client(client) -> None:
         client.stop()
     finally:
         client.join(timeout=1.0)
+
+
+def _prompt_trial_result_label() -> str:
+    try:
+        return click.prompt(
+            "Trial result",
+            type=click.Choice(("success", "failure"), case_sensitive=False),
+            default="failure",
+        ).lower()
+    except (click.Abort, EOFError, KeyboardInterrupt):
+        print("[TrialRecorder] No result entered; defaulting to failure")
+        return "failure"
 
 
 @contextmanager
@@ -856,6 +873,11 @@ def validate_finite_timeout(ctx, param, value):
     is_flag=True,
     help='Save one lossless policy-input image set before start, then exit',
 )
+@click.option(
+    '--save-trial',
+    is_flag=True,
+    help='Record one deployment trial with steps and periodic lossless images',
+)
 @click.option('--cam_path', default=list(SERVER_CONFIG.camera.device_paths), type=list, help="-") #the former one is left hand, the later one is right hand
 
 @click.option('--quest_2_ee_left', default=None, help="-") # eye-hand transform matrix
@@ -918,6 +940,7 @@ def validate_finite_timeout(ctx, param, value):
 def main(
     save_obs,
     save_image_snapshot,
+    save_trial,
     cam_path,
     quest_2_ee_left,
     quest_2_ee_right,
@@ -944,6 +967,11 @@ def main(
     if save_image_snapshot and (dry_run or save_obs):
         raise click.UsageError(
             '--save-image-snapshot cannot be combined with --dry-run or --save_obs'
+        )
+    if save_trial and (dry_run or save_image_snapshot or save_obs):
+        raise click.UsageError(
+            '--save-trial cannot be combined with '
+            '--dry-run, --save-image-snapshot, or --save_obs'
         )
     max_executed_actions = _validate_max_executed_actions(max_executed_actions)
     (
@@ -1148,17 +1176,43 @@ def main(
                 print(f"[ObsSaver] Observation saving enabled. Directory: {obs_saver.save_dir}")
 
             action_debug_logger = ActionDebugLogger(save_dir=ROOT_DIR, sides=sides)
+            trial_recorder = None
+            trial_failed = False
+            termination_reason = "remote_stop"
+            iter_idx = 0
+            latest_trial_observation = None
+            latest_trial_observation_step = None
+            pending_trial_step = None
+            failure_stage = "trial_start"
+
+            def trial_failure_step():
+                if latest_trial_observation_step is None:
+                    return iter_idx
+                return latest_trial_observation_step
 
             try:
+                if save_trial:
+                    trial_recorder = DeploymentTrialRecorder(
+                        Path(ROOT_DIR) / "deployment_trials",
+                        policy_type=policy_type,
+                        data_type=data_type,
+                        image_interval=5,
+                    )
+                    print(
+                        f"[TrialRecorder] Recording deployment trial to: "
+                        f"{trial_recorder.trial_dir}"
+                    )
+
                 start_delay = 1.0
                 t_start = time.monotonic() + start_delay
-                iter_idx = 0
                 last_status_log_time = time.monotonic()
 
                 while True:
+                    pending_trial_step = None
                     t_cycle_actual_start = time.monotonic()
                     state = client.get_state_update()
                     if state == "stop":
+                        termination_reason = "remote_stop"
                         break
 
                     # 预先计算循环结束的时间点，用于后续的精确等待
@@ -1166,6 +1220,7 @@ def main(
                     loop_length_set = steps_per_inference * dt
 
                     # 获取obs
+                    failure_stage = "observation_capture"
                     obs = env.get_obs()
                     obs_timestamps = obs['timestamp']
 
@@ -1185,18 +1240,73 @@ def main(
                         task=language_prompt,
                         no_state_obs_mode=no_state_obs_mode
                     )
+                    latest_trial_observation = obs_dict
+                    latest_trial_observation_step = iter_idx
+                    if trial_recorder is not None:
+                        if iter_idx == 0:
+                            trial_recorder.save_images(
+                                obs_dict,
+                                reason="initial",
+                                iter_idx=iter_idx,
+                            )
+                        elif trial_recorder.should_save_periodic_images(iter_idx):
+                            trial_recorder.save_images(
+                                obs_dict,
+                                reason="step",
+                                iter_idx=iter_idx,
+                            )
+                    failure_stage = "observation_publish"
                     obs_seq = client.publish_obs(obs_dict)
+                    if trial_recorder is not None:
+                        pending_trial_step = {
+                            "recorded_at": time.time(),
+                            "iter_idx": iter_idx,
+                            "obs_seq": obs_seq,
+                            "observation_timestamp": float(obs_timestamps[-1]),
+                            "state": obs_dict["observation.state"],
+                            "observation_pose": extract_robot_poses(
+                                obs,
+                                sides=sides,
+                            ),
+                            "status": "pending",
+                        }
 
                     time3 = round(time.time(), 2)
+                    failure_stage = "action_wait"
                     try:
                         raw_action = wait_for_action_or_stop(
                             client,
                             obs_seq=obs_seq,
                             timeout_s=action_timeout_s,
                         )
-                    except (ActionTimeout, ClientDisconnected, ClientStopRequested) as exc:
+                    except ClientStopRequested as exc:
+                        termination_reason = "client_stop"
                         print(f"[main] {exc}")
                         break
+                    except (ActionTimeout, ClientDisconnected) as exc:
+                        trial_failed = True
+                        termination_reason = (
+                            "action_timeout"
+                            if isinstance(exc, ActionTimeout)
+                            else "client_disconnected"
+                        )
+                        if trial_recorder is not None:
+                            try:
+                                trial_recorder.record_failure(
+                                    exc,
+                                    failure_step=trial_failure_step(),
+                                    observation=latest_trial_observation,
+                                    stage=failure_stage,
+                                )
+                            except Exception as recorder_exc:
+                                print(f"[TrialRecorder] Failed to record failure: {recorder_exc}")
+                        print(f"[main] {exc}")
+                        break
+
+                    if pending_trial_step is not None:
+                        pending_trial_step["raw_action"] = np.asarray(
+                            raw_action
+                        ).copy()
 
                     time4 = round(time.time(), 2)
                     obs_time_last = round(obs_timestamps[-1],2)
@@ -1205,6 +1315,7 @@ def main(
                     # 计算动作执行时间戳
                     # 指定推理出来的每个动作该在什么时间点执行
 
+                    failure_stage = "action_execution"
                     result = execute_action_chunk_and_publish_ack(
                         client,
                         obs_seq,
@@ -1235,6 +1346,7 @@ def main(
                     latency = result.latency
                     controller_action_records = result.controller_records
 
+                    failure_stage = "post_execution_observation"
                     new_obs = env.get_obs()
                     action_debug_logger.log_iteration(
                         iter_idx=iter_idx,
@@ -1249,7 +1361,29 @@ def main(
                         is_new=is_new,
                         n_robots=len(cam_path),
                     )
+                    if trial_recorder is not None:
+                        pending_trial_step.update(
+                            {
+                                "status": "completed",
+                                "conversion_pose": extract_robot_poses(
+                                    result.conversion_obs,
+                                    sides=sides,
+                                ),
+                                "raw_action": raw_action,
+                                "decoded_relative_action": decode_relative_actions(
+                                    raw_action,
+                                    sides=sides,
+                                ),
+                                "absolute_target": new_action,
+                                "action_timestamps": action_timestamps,
+                                "accepted_action_mask": is_new,
+                                "controller_records": controller_action_records,
+                            }
+                        )
+                        trial_recorder.log_step(pending_trial_step)
+                        pending_trial_step = None
 
+                    failure_stage = "cycle_wait"
                     now = time.monotonic()
                     if now - last_status_log_time >= 2.0:
                         print(
@@ -1280,9 +1414,42 @@ def main(
                     iter_idx += steps_per_inference
 
             except KeyboardInterrupt:
+                termination_reason = "keyboard_interrupt"
                 print("Interrupted!")
+            except Exception as exc:
+                trial_failed = True
+                termination_reason = "exception"
+                if trial_recorder is not None:
+                    if pending_trial_step is not None:
+                        pending_trial_step.update(
+                            {
+                                "status": "failed",
+                                "failure_stage": failure_stage,
+                                "failure_type": type(exc).__name__,
+                                "failure_message": str(exc),
+                            }
+                        )
+                        try:
+                            trial_recorder.log_step(pending_trial_step)
+                        except Exception as recorder_exc:
+                            print(
+                                "[TrialRecorder] Failed to record failed step: "
+                                f"{recorder_exc}"
+                            )
+                        pending_trial_step = None
+                    try:
+                        trial_recorder.record_failure(
+                            exc,
+                            failure_step=trial_failure_step(),
+                            observation=latest_trial_observation,
+                            stage=failure_stage,
+                        )
+                    except Exception as recorder_exc:
+                        print(f"[TrialRecorder] Failed to record failure: {recorder_exc}")
+                raise
 
             finally:
+                primary_error = sys.exc_info()[1]
                 # Robot motion must be stopped and the Controller child joined
                 # before client teardown, debug draining, Plotly, or PNG export.
                 controller_stop_error = None
@@ -1312,24 +1479,108 @@ def main(
                         action_debug_logger.close()
                     except Exception as exc:
                         print(f"[cleanup] Failed to close action debug logger: {exc}")
+                    if trial_recorder is not None:
+                        try:
+                            trial_recorder.record_failure(
+                                controller_stop_error,
+                                failure_step=trial_failure_step(),
+                                observation=latest_trial_observation,
+                                stage="controller_stop",
+                            )
+                        except Exception as exc:
+                            print(f"[cleanup] Failed to record trial failure: {exc}")
+                        try:
+                            trial_recorder.finish(
+                                result_label="failure",
+                                termination_reason="controller_stop_failure",
+                            )
+                        except Exception as exc:
+                            print(f"[cleanup] Failed to finalize trial record: {exc}")
                     raise RuntimeError(
                         "failed to stop Controller; skipped debug plots and PNG export"
                     ) from controller_stop_error
 
-                client.stop()
-                client.join(timeout=1.0)
-                # stop obs saver
-                if obs_saver is not None:
-                    obs_saver.stop()
+                cleanup_error = None
+                cleanup_stage = None
 
-                final_debug_samples = append_debug_info(env, debug_info)
-                if final_debug_samples > 0:
-                    print(f"[debug] Collected {final_debug_samples} final debug samples")
+                def remember_cleanup_error(stage, error):
+                    nonlocal cleanup_error, cleanup_stage
+                    if cleanup_error is None:
+                        cleanup_error = error
+                        cleanup_stage = stage
+                    else:
+                        print(f"[cleanup] Additional {stage} failure: {error}")
+
+                try:
+                    _stop_robot_client(client)
+                except Exception as exc:
+                    remember_cleanup_error("client_cleanup", exc)
+
+                if obs_saver is not None:
+                    try:
+                        obs_saver.stop()
+                    except Exception as exc:
+                        remember_cleanup_error("observation_saver_cleanup", exc)
+
+                try:
+                    final_debug_samples = append_debug_info(env, debug_info)
+                    if final_debug_samples > 0:
+                        print(
+                            f"[debug] Collected {final_debug_samples} final debug samples"
+                        )
+                except Exception as exc:
+                    remember_cleanup_error("debug_cleanup", exc)
 
                 # Deployment plotting is intentionally disabled because Plotly /
                 # Kaleido image export can delay shutdown for a long time.
                 # action_debug_logger.plot()
-                action_debug_logger.close()
+                try:
+                    action_debug_logger.close()
+                except Exception as exc:
+                    remember_cleanup_error("action_logger_cleanup", exc)
+
+                if cleanup_error is not None and trial_recorder is not None:
+                    trial_failed = True
+                    if primary_error is None:
+                        termination_reason = "cleanup_exception"
+                    try:
+                        trial_recorder.record_failure(
+                            cleanup_error,
+                            failure_step=trial_failure_step(),
+                            observation=latest_trial_observation,
+                            stage=cleanup_stage,
+                        )
+                    except Exception as exc:
+                        remember_cleanup_error("trial_failure_recording", exc)
+
+                if trial_recorder is not None:
+                    result_label = (
+                        "failure"
+                        if trial_failed
+                        else _prompt_trial_result_label()
+                    )
+                    try:
+                        trial_recorder.finish(
+                            result_label=result_label,
+                            termination_reason=termination_reason,
+                        )
+                        print(
+                            f"[TrialRecorder] Saved deployment trial to: "
+                            f"{trial_recorder.trial_dir}"
+                        )
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                        else:
+                            print(f"[cleanup] Failed to finalize trial record: {exc}")
+
+                if cleanup_error is not None:
+                    if primary_error is None:
+                        raise cleanup_error
+                    print(
+                        "[cleanup] Preserving primary exception after cleanup "
+                        f"failure: {cleanup_error}"
+                    )
 
                 # ee-vs-target PNG export is intentionally disabled.
                 # t = debug_info['time']

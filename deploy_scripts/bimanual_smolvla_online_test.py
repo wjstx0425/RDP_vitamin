@@ -88,6 +88,7 @@ def call_main(**updates):
     kwargs = {
         "save_obs": False,
         "save_image_snapshot": False,
+        "save_trial": False,
         "cam_path": ["/dev/video0", "/dev/video2"],
         "quest_2_ee_left": np.eye(4),
         "quest_2_ee_right": np.eye(4),
@@ -478,6 +479,319 @@ def test_stop_robot_client_attempts_join_when_stop_fails():
         smolvla._stop_robot_client(FailingStopClient())
 
     assert calls == ["stop", ("join", 1.0)]
+
+
+@pytest.mark.parametrize(
+    "termination",
+    [
+        "normal_stop",
+        "action_timeout",
+        "execution_error",
+        "client_cleanup_error",
+        "controller_stop_failure",
+    ],
+)
+def test_save_trial_records_control_steps_images_and_result(
+    monkeypatch,
+    tmp_path,
+    termination,
+):
+    events = []
+    image_keys = (
+        "observation.images.camera0",
+        "observation.images.camera1",
+        "observation.images.tactile_left_0",
+        "observation.images.tactile_right_0",
+        "observation.images.tactile_left_1",
+        "observation.images.tactile_right_1",
+    )
+    policy_observation = {
+        key: np.zeros((224, 224, 3), dtype=np.uint8) for key in image_keys
+    }
+    policy_observation["observation.state"] = np.arange(20, dtype=np.float32)
+    policy_observation["task"] = "pick up two tubes"
+
+    env_observation = {
+        "timestamp": np.array([100.25]),
+        "robot0_eef_pos": np.array([[1.0, 2.0, 3.0]]),
+        "robot0_eef_rot_axis_angle": np.array([[0.1, 0.2, 0.3]]),
+        "robot0_gripper_width": np.array([[0.04]]),
+        "robot1_eef_pos": np.array([[4.0, 5.0, 6.0]]),
+        "robot1_eef_rot_axis_angle": np.array([[0.4, 0.5, 0.6]]),
+        "robot1_gripper_width": np.array([[0.05]]),
+    }
+    raw_action = np.zeros((1, 20), dtype=np.float32)
+    raw_action[:, 3:9] = [1, 0, 0, 0, 1, 0]
+    raw_action[:, 13:19] = [1, 0, 0, 0, 1, 0]
+    absolute_target = np.arange(14, dtype=np.float32).reshape(1, 14)
+
+    class RuntimeClient(FakeStartupClient):
+        def __init__(self):
+            super().__init__(
+                config=valid_config(
+                    policy_type="rdp",
+                    data_type="vitac",
+                    steps_per_inference=1,
+                    action_horizon=1,
+                )
+            )
+            self.states = (
+                [None] * 6 + ["stop"]
+                if termination == "normal_stop"
+                else [None, "stop"]
+            )
+
+        def publish_obs(self, _obs):
+            return 17
+
+        def get_state_update(self):
+            if termination in (
+                "normal_stop",
+                "client_cleanup_error",
+                "controller_stop_failure",
+            ):
+                return self.states.pop(0)
+            return None
+
+        def stop(self):
+            if termination == "client_cleanup_error":
+                events.append("client_stop_error")
+                raise RuntimeError("client cleanup failed")
+            super().stop()
+
+    class FakeSharedMemoryManager:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class RuntimeEnv:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_obs(self):
+            return env_observation
+
+        def stop_controller(self, *, wait):
+            events.append(("controller_stop", wait))
+
+            if termination == "controller_stop_failure":
+                raise TimeoutError("controller stop failed")
+
+        def get_debug_info(self):
+            return {}
+
+    class FakeActionDebugLogger:
+        def __init__(self, **_kwargs):
+            pass
+
+        def log_iteration(self, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeTrialRecorder:
+        instances = []
+
+        def __init__(self, output_root, **kwargs):
+            self.output_root = output_root
+            self.kwargs = kwargs
+            self.trial_dir = tmp_path / "trial"
+            self.images = []
+            self.steps = []
+            self.failures = []
+            self.finishes = []
+            self.__class__.instances.append(self)
+
+        def should_save_periodic_images(self, iter_idx):
+            return iter_idx > 0 and iter_idx % 5 == 0
+
+        def save_images(self, observation, *, reason, iter_idx):
+            self.images.append((reason, iter_idx, observation))
+
+        def log_step(self, record):
+            self.steps.append(record)
+            if termination == "execution_error":
+                raise OSError("step log write failed")
+
+        def record_failure(
+            self, error, *, failure_step, observation, stage
+        ):
+            self.failures.append(
+                (type(error).__name__, failure_step, observation, stage)
+            )
+            if termination == "controller_stop_failure":
+                raise OSError("controller failure image submission failed")
+            if termination == "execution_error":
+                raise OSError("failure image submission failed")
+
+        def finish(self, *, result_label, termination_reason):
+            events.append(("finish", result_label, termination_reason))
+            self.finishes.append((result_label, termination_reason))
+
+    client = RuntimeClient()
+    fake_env_module = types.ModuleType("real_world.bimanual_umi_env")
+    fake_env_module.BimanualUmiEnv = RuntimeEnv
+
+    def wait_for_action(*_args, **_kwargs):
+        if termination == "action_timeout":
+            raise smolvla.ActionTimeout("timed out")
+        return raw_action.copy()
+
+    def execute_chunk(*_args, **_kwargs):
+        if termination == "execution_error":
+            raise RuntimeError("action execution failed")
+        return smolvla.ActionChunkResult(
+            validated=raw_action.copy(),
+            action_timestamps=np.array([100.30]),
+            fresh=smolvla.FreshActions(
+                mask=np.array([True]),
+                raw=raw_action.copy(),
+                absolute=absolute_target.copy(),
+                timestamps=np.array([100.30]),
+            ),
+            conversion_obs=env_observation,
+            latency=0.01,
+            controller_records=[{"scheduled": True}],
+        )
+
+    clock = {"value": 100.0}
+
+    def monotonic():
+        clock["value"] += 0.1
+        return clock["value"]
+
+    monkeypatch.setattr(smolvla, "load_token_list", lambda _: ["token"])
+    monkeypatch.setattr(smolvla, "RobotClient", lambda **_: client)
+    monkeypatch.setattr(smolvla, "SharedMemoryManager", FakeSharedMemoryManager)
+    monkeypatch.setattr(smolvla, "ActionDebugLogger", FakeActionDebugLogger)
+    monkeypatch.setattr(
+        smolvla,
+        "DeploymentTrialRecorder",
+        FakeTrialRecorder,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_smolvla_config",
+        lambda _client, _deadline: client.config,
+    )
+    monkeypatch.setattr(smolvla, "wait_for_start", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(smolvla, "wait_for_action_or_stop", wait_for_action)
+    monkeypatch.setattr(
+        smolvla,
+        "execute_action_chunk_and_publish_ack",
+        execute_chunk,
+    )
+    monkeypatch.setattr(
+        smolvla,
+        "get_real_umi_obs_dict",
+        lambda **_kwargs: policy_observation,
+    )
+    monkeypatch.setattr(smolvla.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(smolvla.time, "monotonic", monotonic)
+    monkeypatch.setattr(smolvla.time, "time", lambda: 100.5)
+    monkeypatch.setattr(smolvla.cv2, "setNumThreads", lambda _count: None)
+    monkeypatch.setitem(sys.modules, "real_world.bimanual_umi_env", fake_env_module)
+
+    def prompt(*_args, **_kwargs):
+        if termination != "normal_stop":
+            pytest.fail("failed trial prompted for a result label")
+        events.append("prompt")
+        return "success"
+
+    monkeypatch.setattr(smolvla.click, "prompt", prompt)
+
+    if termination == "execution_error":
+        with pytest.raises(RuntimeError, match="action execution failed"):
+            call_main(save_trial=True)
+    elif termination == "client_cleanup_error":
+        with pytest.raises(RuntimeError, match="client cleanup failed"):
+            call_main(save_trial=True)
+    elif termination == "controller_stop_failure":
+        with pytest.raises(RuntimeError, match="failed to stop Controller"):
+            call_main(save_trial=True)
+    else:
+        call_main(save_trial=True)
+
+    recorder = FakeTrialRecorder.instances[0]
+    assert recorder.kwargs == {
+        "policy_type": "rdp",
+        "data_type": "vitac",
+        "image_interval": 5,
+    }
+    assert recorder.images[0] == ("initial", 0, policy_observation)
+    controller_stop_index = events.index(("controller_stop", True))
+
+    if termination == "normal_stop":
+        assert [(reason, step) for reason, step, _ in recorder.images] == [
+            ("initial", 0),
+            ("step", 5),
+        ]
+        assert len(recorder.steps) == 6
+        first_step = recorder.steps[0]
+        assert first_step["iter_idx"] == 0
+        assert first_step["obs_seq"] == 17
+        assert first_step["observation_timestamp"] == 100.25
+        np.testing.assert_array_equal(
+            first_step["state"],
+            policy_observation["observation.state"],
+        )
+        np.testing.assert_array_equal(first_step["raw_action"], raw_action)
+        np.testing.assert_array_equal(
+            first_step["absolute_target"],
+            absolute_target,
+        )
+        assert set(first_step["decoded_relative_action"]) == {"left", "right"}
+        assert set(first_step["observation_pose"]) == {"left", "right"}
+        assert set(first_step["conversion_pose"]) == {"left", "right"}
+        assert recorder.failures == []
+        assert recorder.finishes == [("success", "remote_stop")]
+        assert controller_stop_index < events.index("prompt")
+        assert events.index("prompt") < events.index(
+            ("finish", "success", "remote_stop")
+        )
+    elif termination == "action_timeout":
+        assert recorder.steps == []
+        assert recorder.failures == [
+            ("ActionTimeout", 0, policy_observation, "action_wait")
+        ]
+        assert recorder.finishes == [("failure", "action_timeout")]
+        assert controller_stop_index < events.index(
+            ("finish", "failure", "action_timeout")
+        )
+    elif termination == "execution_error":
+        assert len(recorder.steps) == 1
+        failed_step = recorder.steps[0]
+        assert failed_step["status"] == "failed"
+        assert failed_step["failure_stage"] == "action_execution"
+        np.testing.assert_array_equal(failed_step["raw_action"], raw_action)
+        assert recorder.failures == [
+            ("RuntimeError", 0, policy_observation, "action_execution")
+        ]
+        assert recorder.finishes == [("failure", "exception")]
+    elif termination == "client_cleanup_error":
+        assert len(recorder.steps) == 1
+        assert recorder.failures == [
+            ("RuntimeError", 0, policy_observation, "client_cleanup")
+        ]
+        assert recorder.finishes == [("failure", "cleanup_exception")]
+    else:
+        assert len(recorder.steps) == 1
+        assert recorder.failures == [
+            ("TimeoutError", 0, policy_observation, "controller_stop")
+        ]
+        assert recorder.finishes == [
+            ("failure", "controller_stop_failure")
+        ]
 
 
 def test_cli_does_not_expose_removed_control_options():
