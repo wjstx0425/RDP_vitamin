@@ -12,8 +12,6 @@ from configs.camera_config import CameraConfig, DEFAULT_CAMERA_CONFIG
 from real_world.robot_api.arm.Controller import Controller
 from real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 
-from utils.common.cv2_util import get_image_transform
-
 from utils.interpolation_util import get_interp1d, PoseInterpolator
 from utils.pose_util import pose_to_mat, mat_to_pose, pose_to_pos_quat, pos_quat_to_pose
 from utils.cv_util import draw_fisheye_mask
@@ -22,6 +20,23 @@ import cv2
 import time
 
 from real_world.robot_api.arm.RobotControl_pykin import RobotControl
+
+
+def _resize_panel_for_model(
+    panel: np.ndarray,
+    output_resolution: tuple[int, int],
+    obs_float32: bool,
+) -> np.ndarray:
+    """Match collection-time panel resizing and convert decoded BGR to RGB."""
+    resized = cv2.resize(
+        panel,
+        output_resolution,
+        interpolation=cv2.INTER_LINEAR,
+    )
+    resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    if obs_float32:
+        resized = resized.astype(np.float32) / 255
+    return resized
 
 
 def _select_alignment_camera_idx(camera_data: dict, num_obs_cameras: int) -> int:
@@ -195,25 +210,26 @@ class BimanualUmiEnv:
                     # if is_right:
                     #     visual = cv2.rotate(visual, cv2.ROTATE_180)
 
-                    # Resize函数
-                    f = get_image_transform(
-                        input_res=(panel_width, total_height),
-                        output_res=obs_image_resolution,
-                        bgr_to_rgb=True)
-
                     # 处理visual（总是需要）
-                    visual_resized = f(visual)
-                    if obs_float32:
-                        visual_resized = visual_resized.astype(np.float32) / 255
+                    visual_resized = _resize_panel_for_model(
+                        visual,
+                        obs_image_resolution,
+                        obs_float32,
+                    )
                     data['color'] = visual_resized  # 统一存为color
 
                     # 根据data_type决定是否处理tactile
                     if data_type == 'vitac':
-                        left_tactile_resized = f(left_tactile)
-                        right_tactile_resized = f(right_tactile)
-                        if obs_float32:
-                            left_tactile_resized = left_tactile_resized.astype(np.float32) / 255
-                            right_tactile_resized = right_tactile_resized.astype(np.float32) / 255
+                        left_tactile_resized = _resize_panel_for_model(
+                            left_tactile,
+                            obs_image_resolution,
+                            obs_float32,
+                        )
+                        right_tactile_resized = _resize_panel_for_model(
+                            right_tactile,
+                            obs_image_resolution,
+                            obs_float32,
+                        )
                         data['left_tactile'] = left_tactile_resized
                         data['right_tactile'] = right_tactile_resized
 
