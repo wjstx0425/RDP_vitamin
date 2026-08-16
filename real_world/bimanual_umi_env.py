@@ -201,11 +201,6 @@ class BimanualUmiEnv:
                     visual = img[:, panel_width:2*panel_width]
                     right_tactile = img[:, 2*panel_width:3*panel_width]
 
-                    # Process
-                    left_tactile = cv2.rotate(left_tactile, cv2.ROTATE_180)
-                    visual = visual
-                    right_tactile = right_tactile
-
                     # # left hand的visual旋转180度
                     # if is_right:
                     #     visual = cv2.rotate(visual, cv2.ROTATE_180)

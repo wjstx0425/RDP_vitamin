@@ -14,7 +14,12 @@ def _training_resize_rgb(panel: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
 
-def _capture_deploy_transform(monkeypatch, *, obs_float32: bool):
+def _capture_deploy_transform(
+    monkeypatch,
+    *,
+    obs_float32: bool,
+    camera_idx: int = 0,
+):
     captured = {}
 
     class FakeMultiUvcCamera:
@@ -30,13 +35,13 @@ def _capture_deploy_transform(monkeypatch, *, obs_float32: bool):
     monkeypatch.setattr(env_module, "Controller", lambda **_kwargs: object())
 
     env_module.BimanualUmiEnv(
-        cam_path=["/dev/video-test"],
+        cam_path=["/dev/video-test-0", "/dev/video-test-1"],
         data_type="vitac",
         obs_image_resolution=(224, 224),
         obs_float32=obs_float32,
         shm_manager=object(),
     )
-    return captured["transforms"][0]
+    return captured["transforms"][camera_idx]
 
 
 @pytest.fixture
@@ -63,12 +68,16 @@ def triptych_bgr_frame() -> np.ndarray:
     return np.concatenate((left_tactile, visual, right_tactile), axis=1)
 
 
-@pytest.fixture
-def deploy_transform(monkeypatch):
-    return _capture_deploy_transform(monkeypatch, obs_float32=False)
+@pytest.fixture(params=[0, 1])
+def deploy_transform(monkeypatch, request):
+    return _capture_deploy_transform(
+        monkeypatch,
+        obs_float32=False,
+        camera_idx=request.param,
+    )
 
 
-def test_vitac_transform_matches_training_triptych_preprocessing(
+def test_vitac_transform_preserves_left_tactile_panel_orientation(
     deploy_transform,
     triptych_bgr_frame: np.ndarray,
 ) -> None:
@@ -80,9 +89,7 @@ def test_vitac_transform_matches_training_triptych_preprocessing(
 
     expected = {
         "color": _training_resize_rgb(visual),
-        "left_tactile": _training_resize_rgb(
-            cv2.rotate(left_tactile, cv2.ROTATE_180)
-        ),
+        "left_tactile": _training_resize_rgb(left_tactile),
         "right_tactile": _training_resize_rgb(right_tactile),
     }
 
@@ -96,8 +103,8 @@ def test_vitac_transform_matches_training_triptych_preprocessing(
 
     assert actual["color"][112, 0].tolist() == [200, 20, 10]
     assert actual["color"][112, -1].tolist() == [40, 220, 30]
-    assert actual["left_tactile"][-1, -1].tolist() == [211, 31, 7]
-    assert actual["left_tactile"][0, 0].tolist() == [19, 61, 171]
+    assert actual["left_tactile"][0, 0].tolist() == [211, 31, 7]
+    assert actual["left_tactile"][-1, -1].tolist() == [19, 61, 171]
 
 
 def test_vitac_transform_preserves_float32_output_contract(
@@ -115,9 +122,7 @@ def test_vitac_transform_preserves_float32_output_contract(
     )
     expected = {
         "color": _training_resize_rgb(visual).astype(np.float32) / 255,
-        "left_tactile": _training_resize_rgb(
-            cv2.rotate(left_tactile, cv2.ROTATE_180)
-        ).astype(np.float32)
+        "left_tactile": _training_resize_rgb(left_tactile).astype(np.float32)
         / 255,
         "right_tactile": _training_resize_rgb(right_tactile).astype(np.float32)
         / 255,
