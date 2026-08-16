@@ -299,6 +299,40 @@ def test_bimanual_start_cleans_up_both_groups_and_preserves_timeout() -> None:
     assert ("controller", "stop_wait") not in calls
 
 
+@pytest.mark.parametrize("failing_child", ["camera", "controller"])
+def test_bimanual_start_cleans_up_when_child_start_raises(failing_child) -> None:
+    calls = []
+
+    class FakeChildGroup:
+        def __init__(self, name: str):
+            self.name = name
+
+        def start(self, *, wait: bool) -> None:
+            calls.append((self.name, "start", wait))
+            if self.name == failing_child:
+                raise RuntimeError(f"{self.name} start failed")
+
+        def stop(self, *, wait: bool) -> None:
+            calls.append((self.name, "stop", wait))
+
+        def is_alive(self) -> bool:
+            return False
+
+        def stop_wait(self, timeout: float | None = None) -> None:
+            raise AssertionError("inactive child must not be joined")
+
+    env = BimanualUmiEnv.__new__(BimanualUmiEnv)
+    env.camera = FakeChildGroup("camera")
+    env.controller = FakeChildGroup("controller")
+    env.STARTUP_FAILURE_CLEANUP_TIMEOUT = 0.01
+
+    with pytest.raises(RuntimeError, match=f"{failing_child} start failed"):
+        env.start()
+
+    assert ("camera", "stop", False) in calls
+    assert ("controller", "stop", False) in calls
+
+
 def test_bimanual_start_bounds_cleanup_and_still_attempts_controller() -> None:
     stop_wait_calls = []
 

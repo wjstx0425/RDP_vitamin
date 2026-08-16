@@ -87,6 +87,7 @@ class FakeStartupClient:
 def call_main(**updates):
     kwargs = {
         "save_obs": False,
+        "save_image_snapshot": False,
         "cam_path": ["/dev/video0", "/dev/video2"],
         "quest_2_ee_left": np.eye(4),
         "quest_2_ee_right": np.eye(4),
@@ -170,6 +171,313 @@ def test_deployment_snapshot_rejects_invalid_observations(
             policy_type="rdp",
             data_type="vitac",
         )
+
+
+@pytest.mark.parametrize("other_args", [["--dry-run"], ["--save_obs", "true"]])
+def test_snapshot_rejects_incompatible_modes_before_client(monkeypatch, other_args):
+    monkeypatch.setattr(
+        smolvla,
+        "RobotClient",
+        lambda **_kwargs: pytest.fail(
+            "invalid snapshot mode constructed RobotClient"
+        ),
+    )
+
+    result = CliRunner().invoke(
+        smolvla.main,
+        ["--save-image-snapshot", *other_args],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
+
+
+def test_snapshot_saves_warmup_obs_and_exits_before_publish_or_start(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+
+    class SnapshotClient(FakeStartupClient):
+        def publish_obs(self, _obs):
+            pytest.fail("snapshot mode published an observation")
+
+        def stop(self):
+            super().stop()
+            events.append("client_stop")
+
+    class FakeSharedMemoryManager:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class SnapshotEnv:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            events.append("env_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("env_exit")
+            return False
+
+        def get_obs(self):
+            events.append("get_obs")
+            return {"timestamp": np.array([100.0]), **zero_robot_obs()}
+
+    client = SnapshotClient(
+        config=valid_config(
+            policy_type="rdp",
+            data_type="vitac",
+            steps_per_inference=1,
+            action_horizon=1,
+        )
+    )
+    expected_observation = {
+        key: np.zeros((224, 224, 3), dtype=np.uint8)
+        for key in (
+            "observation.images.camera0",
+            "observation.images.camera1",
+            "observation.images.tactile_left_0",
+            "observation.images.tactile_right_0",
+            "observation.images.tactile_left_1",
+            "observation.images.tactile_right_1",
+        )
+    }
+    captured = {}
+    expected_path = tmp_path / "snapshot"
+    fake_env_module = types.ModuleType("real_world.bimanual_umi_env")
+    fake_env_module.BimanualUmiEnv = SnapshotEnv
+
+    monkeypatch.setattr(smolvla, "load_token_list", lambda _: ["token"])
+    monkeypatch.setattr(smolvla, "RobotClient", lambda **_: client)
+    monkeypatch.setattr(smolvla, "SharedMemoryManager", FakeSharedMemoryManager)
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_smolvla_config",
+        lambda _client, _deadline: client.config,
+    )
+    monkeypatch.setattr(
+        smolvla,
+        "get_real_umi_obs_dict",
+        lambda **_kwargs: expected_observation,
+    )
+
+    def save_snapshot(observation, *_args, **_kwargs):
+        captured["observation"] = observation
+        events.append("save_snapshot")
+        return expected_path
+
+    monkeypatch.setattr(smolvla, "save_deployment_image_snapshot", save_snapshot)
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_start",
+        lambda *_args, **_kwargs: pytest.fail("snapshot mode waited for start"),
+    )
+    monkeypatch.setattr(smolvla.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(smolvla.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(smolvla.cv2, "setNumThreads", lambda _count: None)
+    monkeypatch.setitem(sys.modules, "real_world.bimanual_umi_env", fake_env_module)
+
+    result = call_main(save_image_snapshot=True)
+
+    assert result == expected_path
+    assert captured["observation"] is expected_observation
+    assert events == [
+        "env_enter",
+        "get_obs",
+        "get_obs",
+        "save_snapshot",
+        "env_exit",
+        "client_stop",
+    ]
+    assert client.join_timeouts == [1.0]
+
+
+@pytest.mark.parametrize("failure_stage", ["observation_conversion", "writer"])
+def test_snapshot_failure_cleans_up_client_and_hardware(
+    monkeypatch,
+    failure_stage,
+):
+    events = []
+
+    class SnapshotClient(FakeStartupClient):
+        def publish_obs(self, _obs):
+            pytest.fail("snapshot failure path published an observation")
+
+        def stop(self):
+            super().stop()
+            events.append("client_stop")
+
+    class FakeSharedMemoryManager:
+        def __enter__(self):
+            events.append("shm_enter")
+            return object()
+
+        def __exit__(self, *_args):
+            events.append("shm_exit")
+            return False
+
+    class SnapshotEnv:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            events.append("env_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("env_exit")
+            return False
+
+        def get_obs(self):
+            events.append("get_obs")
+            return {"timestamp": np.array([100.0]), **zero_robot_obs()}
+
+    client = SnapshotClient(
+        config=valid_config(
+            policy_type="rdp",
+            data_type="vitac",
+            steps_per_inference=1,
+            action_horizon=1,
+        )
+    )
+    fake_env_module = types.ModuleType("real_world.bimanual_umi_env")
+    fake_env_module.BimanualUmiEnv = SnapshotEnv
+
+    def convert_observation(**_kwargs):
+        events.append("convert_observation")
+        if failure_stage == "observation_conversion":
+            raise RuntimeError("observation conversion failed")
+        return {
+            "observation.images.camera0": np.zeros(
+                (224, 224, 3), dtype=np.uint8
+            )
+        }
+
+    def fail_writer(*_args, **_kwargs):
+        events.append("snapshot_writer")
+        raise RuntimeError("snapshot writer failed")
+
+    monkeypatch.setattr(smolvla, "load_token_list", lambda _: ["token"])
+    monkeypatch.setattr(smolvla, "RobotClient", lambda **_: client)
+    monkeypatch.setattr(smolvla, "SharedMemoryManager", FakeSharedMemoryManager)
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_smolvla_config",
+        lambda _client, _deadline: client.config,
+    )
+    monkeypatch.setattr(smolvla, "get_real_umi_obs_dict", convert_observation)
+    monkeypatch.setattr(smolvla, "save_deployment_image_snapshot", fail_writer)
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_start",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot failure path waited for start"
+        ),
+    )
+    monkeypatch.setattr(smolvla.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(smolvla.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(smolvla.cv2, "setNumThreads", lambda _count: None)
+    monkeypatch.setitem(sys.modules, "real_world.bimanual_umi_env", fake_env_module)
+
+    with pytest.raises(RuntimeError, match=failure_stage.replace("_", " ")):
+        call_main(save_image_snapshot=True)
+
+    assert client.stopped
+    assert client.join_timeouts == [1.0]
+    assert "env_exit" in events
+    assert "shm_exit" in events
+    if failure_stage == "observation_conversion":
+        assert "snapshot_writer" not in events
+
+
+def test_snapshot_calibration_failure_stops_client(monkeypatch):
+    client = FakeStartupClient(
+        config=valid_config(
+            policy_type="rdp",
+            data_type="vitac",
+            steps_per_inference=1,
+            action_horizon=1,
+        )
+    )
+    monkeypatch.setattr(smolvla, "load_token_list", lambda _: ["token"])
+    monkeypatch.setattr(smolvla, "RobotClient", lambda **_: client)
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_smolvla_config",
+        lambda _client, _deadline: client.config,
+    )
+    monkeypatch.setattr(
+        smolvla.np,
+        "load",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("calibration failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="calibration failed"):
+        call_main(save_image_snapshot=True, quest_2_ee_left=None)
+
+    assert client.stopped
+    assert client.join_timeouts == [1.0]
+
+
+@pytest.mark.parametrize("failure_stage", ["environment_import", "opencv_setup"])
+def test_snapshot_pre_hardware_failure_stops_client(monkeypatch, failure_stage):
+    client = FakeStartupClient(
+        config=valid_config(
+            policy_type="rdp",
+            data_type="vitac",
+            steps_per_inference=1,
+            action_horizon=1,
+        )
+    )
+    fake_env_module = types.ModuleType("real_world.bimanual_umi_env")
+    if failure_stage == "opencv_setup":
+        fake_env_module.BimanualUmiEnv = object
+        monkeypatch.setattr(
+            smolvla.cv2,
+            "setNumThreads",
+            lambda _count: (_ for _ in ()).throw(
+                RuntimeError("opencv setup failed")
+            ),
+        )
+
+    monkeypatch.setattr(smolvla, "load_token_list", lambda _: ["token"])
+    monkeypatch.setattr(smolvla, "RobotClient", lambda **_: client)
+    monkeypatch.setattr(
+        smolvla,
+        "wait_for_smolvla_config",
+        lambda _client, _deadline: client.config,
+    )
+    monkeypatch.setitem(sys.modules, "real_world.bimanual_umi_env", fake_env_module)
+
+    expected_error = ImportError if failure_stage == "environment_import" else RuntimeError
+    with pytest.raises(expected_error):
+        call_main(save_image_snapshot=True)
+
+    assert client.stopped
+    assert client.join_timeouts == [1.0]
+
+
+def test_stop_robot_client_attempts_join_when_stop_fails():
+    calls = []
+
+    class FailingStopClient:
+        def stop(self):
+            calls.append("stop")
+            raise RuntimeError("stop failed")
+
+        def join(self, timeout):
+            calls.append(("join", timeout))
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        smolvla._stop_robot_client(FailingStopClient())
+
+    assert calls == ["stop", ("join", 1.0)]
 
 
 def test_cli_does_not_expose_removed_control_options():

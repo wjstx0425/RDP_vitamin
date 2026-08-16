@@ -21,7 +21,10 @@ def test_parent_opencv_is_single_threaded_before_camera_processes_fork() -> None
     ).read_text(encoding="utf-8")
 
     configure_opencv = source.index("cv2.setNumThreads(1)")
-    start_shared_memory = source.index("with SharedMemoryManager() as shm_manager:")
+    start_shared_memory = source.index(
+        "with _shared_memory_manager_with_client_cleanup(",
+        configure_opencv,
+    )
 
     assert configure_opencv < start_shared_memory
 

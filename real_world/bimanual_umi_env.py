@@ -323,23 +323,23 @@ class BimanualUmiEnv:
         return ready_flag
 
     def start(self, wait=True):
-        self.camera.start(wait=False)
-        self.controller.start(wait=False)
-        if wait:
-            try:
+        try:
+            self.camera.start(wait=False)
+            self.controller.start(wait=False)
+            if wait:
                 self.start_wait()
-            except Exception:
-                children = (self.camera, self.controller)
-                for child in children:
-                    try:
-                        child.stop(wait=False)
-                    except Exception:
-                        pass
+        except Exception:
+            children = (self.camera, self.controller)
+            for child in children:
                 try:
-                    self.stop_wait(timeout=self.STARTUP_FAILURE_CLEANUP_TIMEOUT)
+                    child.stop(wait=False)
                 except Exception:
                     pass
-                raise
+            try:
+                self.stop_wait(timeout=self.STARTUP_FAILURE_CLEANUP_TIMEOUT)
+            except Exception:
+                pass
+            raise
 
     def stop(self, wait=True):
         first_error = None

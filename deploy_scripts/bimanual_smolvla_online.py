@@ -1,5 +1,6 @@
 import sys
 import os
+from contextlib import contextmanager
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(ROOT_DIR)
@@ -362,8 +363,21 @@ def prepare_smolvla_actions(
 
 
 def _stop_robot_client(client) -> None:
-    client.stop()
-    client.join(timeout=1.0)
+    try:
+        client.stop()
+    finally:
+        client.join(timeout=1.0)
+
+
+@contextmanager
+def _shared_memory_manager_with_client_cleanup(client=None):
+    """Stop a snapshot client after all camera/shared-memory teardown."""
+    try:
+        with SharedMemoryManager() as shm_manager:
+            yield shm_manager
+    finally:
+        if client is not None:
+            _stop_robot_client(client)
 
 
 def wait_for_smolvla_config(client, deadline, monotonic=time.monotonic):
@@ -837,6 +851,11 @@ def validate_finite_timeout(ctx, param, value):
 
 @click.command()
 @click.option('--save_obs', '-so', default=False, help='Save observation data for verification (saves every step)')
+@click.option(
+    '--save-image-snapshot',
+    is_flag=True,
+    help='Save one lossless policy-input image set before start, then exit',
+)
 @click.option('--cam_path', default=list(SERVER_CONFIG.camera.device_paths), type=list, help="-") #the former one is left hand, the later one is right hand
 
 @click.option('--quest_2_ee_left', default=None, help="-") # eye-hand transform matrix
@@ -898,6 +917,7 @@ def validate_finite_timeout(ctx, param, value):
 
 def main(
     save_obs,
+    save_image_snapshot,
     cam_path,
     quest_2_ee_left,
     quest_2_ee_right,
@@ -921,6 +941,10 @@ def main(
     controller_start_timeout_s=SERVER_CONFIG.controller_start_timeout_s,
     max_executed_actions=SERVER_CONFIG.max_executed_actions,
     ):
+    if save_image_snapshot and (dry_run or save_obs):
+        raise click.UsageError(
+            '--save-image-snapshot cannot be combined with --dry-run or --save_obs'
+        )
     max_executed_actions = _validate_max_executed_actions(max_executed_actions)
     (
         max_action_pos_delta,
@@ -973,57 +997,71 @@ def main(
 
     # Calibration and robot imports are intentionally below negotiation and
     # dry-run so protocol checks never initialize hardware.
-    if quest_2_ee_left is None:
-        quest_2_ee_left = np.load(SERVER_CONFIG.quest_2_ee_left or DEFAULT_LEFT_CALIBRATION_PATH)
-    if quest_2_ee_right is None:
-        quest_2_ee_right = np.load(SERVER_CONFIG.quest_2_ee_right or DEFAULT_RIGHT_CALIBRATION_PATH)
+    try:
+        if quest_2_ee_left is None:
+            quest_2_ee_left = np.load(
+                SERVER_CONFIG.quest_2_ee_left or DEFAULT_LEFT_CALIBRATION_PATH
+            )
+        if quest_2_ee_right is None:
+            quest_2_ee_right = np.load(
+                SERVER_CONFIG.quest_2_ee_right or DEFAULT_RIGHT_CALIBRATION_PATH
+            )
 
-    policy_type = config_dict["policy_type"]
-    data_type = config_dict["data_type"]
-    language_prompt = config_dict["language_prompt"]
-    control_frequency = SERVER_CONFIG.control_frequency
-    controller_frequency = SERVER_CONFIG.controller_frequency
-    single_arm_mode = config_dict["single_arm_mode"]
-    no_state_obs_mode = config_dict["no_state_obs_mode"]
-    steps_per_inference = min(SERVER_CONFIG.steps_per_inference, config_dict["steps_per_inference"])
-    action_horizon = config_dict["action_horizon"]
-    effective_max_executed_actions = min(
-        steps_per_inference,
-        max_executed_actions,
-    )
+        policy_type = config_dict["policy_type"]
+        data_type = config_dict["data_type"]
+        language_prompt = config_dict["language_prompt"]
+        control_frequency = SERVER_CONFIG.control_frequency
+        controller_frequency = SERVER_CONFIG.controller_frequency
+        single_arm_mode = config_dict["single_arm_mode"]
+        no_state_obs_mode = config_dict["no_state_obs_mode"]
+        steps_per_inference = min(
+            SERVER_CONFIG.steps_per_inference,
+            config_dict["steps_per_inference"],
+        )
+        action_horizon = config_dict["action_horizon"]
+        effective_max_executed_actions = min(
+            steps_per_inference,
+            max_executed_actions,
+        )
 
-    dt = 1/control_frequency
-    cycle_timeout_warn_sec = cycle_timeout_warn_ms / 1000.0
-    obs_res = SMOLVLA_OBSERVATION_RESOLUTION
-    if policy_type == "rdp":
-        obs_res = RDP_OBSERVATION_RESOLUTION
-    if single_arm_mode:
-        cam_path = [cam_path[0]]
+        dt = 1/control_frequency
+        cycle_timeout_warn_sec = cycle_timeout_warn_ms / 1000.0
+        obs_res = SMOLVLA_OBSERVATION_RESOLUTION
+        if policy_type == "rdp":
+            obs_res = RDP_OBSERVATION_RESOLUTION
+        if single_arm_mode:
+            cam_path = [cam_path[0]]
 
-    # DEBUG INFO
-    if not single_arm_mode:
-        sides = ["left", "right"]
-    else:
-        sides = ["left"]
-    paras = ["x", "y", "z", "rx", "ry", "rz", "g"]
-    debug_info = dict()
-    for side in sides:
-        for para in paras:
-            debug_info[f"ee_pose_{side}_{para}"] = []
-            debug_info[f"target_pose_{side}_{para}"] = []
-    debug_info["time"] = []
+        # DEBUG INFO
+        if not single_arm_mode:
+            sides = ["left", "right"]
+        else:
+            sides = ["left"]
+        paras = ["x", "y", "z", "rx", "ry", "rz", "g"]
+        debug_info = dict()
+        for side in sides:
+            for para in paras:
+                debug_info[f"ee_pose_{side}_{para}"] = []
+                debug_info[f"target_pose_{side}_{para}"] = []
+        debug_info["time"] = []
 
-    print("steps_per_inference:", steps_per_inference)
-    print("cycle_timeout_warn_ms:", cycle_timeout_warn_ms)
+        print("steps_per_inference:", steps_per_inference)
+        print("cycle_timeout_warn_ms:", cycle_timeout_warn_ms)
 
-    from real_world.bimanual_umi_env import BimanualUmiEnv
+        from real_world.bimanual_umi_env import BimanualUmiEnv
 
-    # The environment builds transformed shared-memory examples before forking
-    # camera workers. Keep that parent-side OpenCV work single-threaded so the
-    # children do not inherit an unusable native worker pool.
-    cv2.setNumThreads(1)
+        # The environment builds transformed shared-memory examples before forking
+        # camera workers. Keep that parent-side OpenCV work single-threaded so the
+        # children do not inherit an unusable native worker pool.
+        cv2.setNumThreads(1)
+    except Exception:
+        if save_image_snapshot:
+            _stop_robot_client(client)
+        raise
 
-    with SharedMemoryManager() as shm_manager:
+    with _shared_memory_manager_with_client_cleanup(
+        client if save_image_snapshot else None
+    ) as shm_manager:
         with BimanualUmiEnv(
                 data_type=data_type,
                 cam_path=cam_path,
@@ -1077,6 +1115,18 @@ def main(
                 task=language_prompt,
                 no_state_obs_mode=no_state_obs_mode
             )
+            if save_image_snapshot:
+                snapshot_dir = save_deployment_image_snapshot(
+                    obs_dict,
+                    Path(ROOT_DIR) / 'eval_obs_data',
+                    policy_type=policy_type,
+                    data_type=data_type,
+                )
+                print(
+                    f'[ImageSnapshot] Saved deployment images to: '
+                    f'{snapshot_dir}'
+                )
+                return snapshot_dir
             client.publish_obs(obs_dict)
             try:
                 remaining_start_s = start_deadline - time.monotonic()
