@@ -1,5 +1,5 @@
 name: pick_tube_image_tactile_emb_ldp_30fps
-dataset_path: data/pick_tube_01_06_rdp_zarr
+dataset_path: data/pick_tube_01_06_pca30_rdp_zarr
 image_shape: [3, 224, 224]
 
 shape_meta: &shape_meta
@@ -14,11 +14,11 @@ shape_meta: &shape_meta
       shape: [20]
       type: low_dim
     tactile_embedding:
-      shape: [2048]
+      shape: [30]
       type: low_dim
   extended_obs:
     tactile_embedding:
-      shape: [2048]
+      shape: [30]
       type: low_dim
   action:
     shape: [20]

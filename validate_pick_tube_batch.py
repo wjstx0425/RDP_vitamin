@@ -13,7 +13,7 @@ from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealIma
 def shape_meta(include_rgb: bool) -> dict:
     obs = {
         "observation_state": {"shape": [20], "type": "low_dim"},
-        "tactile_embedding": {"shape": [2048], "type": "low_dim"},
+        "tactile_embedding": {"shape": [30], "type": "low_dim"},
     }
     if include_rgb:
         obs = {
@@ -23,7 +23,7 @@ def shape_meta(include_rgb: bool) -> dict:
         }
     return {
         "obs": obs,
-        "extended_obs": {"tactile_embedding": {"shape": [2048], "type": "low_dim"}},
+        "extended_obs": {"tactile_embedding": {"shape": [30], "type": "low_dim"}},
         "action": {"shape": [20]},
     }
 

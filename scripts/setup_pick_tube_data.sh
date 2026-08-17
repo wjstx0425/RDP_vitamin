@@ -20,8 +20,9 @@ RDP_MODEL_REVISION=${RDP_MODEL_REVISION:-main}
 RDP_WEIGHTS_DIR=${RDP_WEIGHTS_DIR:-${RDP_DIR}/data/weights/wjstx_rdp}
 LEROBOT_ROOT=${LEROBOT_ROOT:-/home/hillbot/datasets}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
-DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_rdp_zarr}
-SMOKE_DATASET_PATH=${SMOKE_DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_smoke_rdp_zarr}
+TACTILE_PCA_PATH=${TACTILE_PCA_PATH:-${RDP_DIR}/data/PCA_Transform_PickTube/tactile_pca_2x15.npz}
+DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_pca30_rdp_zarr}
+SMOKE_DATASET_PATH=${SMOKE_DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_pca30_smoke_rdp_zarr}
 ENCODER_DIR=${ENCODER_DIR:-${RDP_DIR}/data/encoder_ckpt_0809}
 ENCODER_RELEASE_BASE=${ENCODER_RELEASE_BASE:-https://alpha.hf-mirror.com/KaiyueChen/encoder_ckpt_0809/resolve/main}
 ENCODER_PARAMS_FILE=params-235cb754d17b461b8be2d652c96fc169.npz
@@ -31,12 +32,13 @@ SMOKE_EPISODES=${SMOKE_EPISODES:-1}
 
 usage() {
   cat <<USAGE
-Usage: $0 <datasets|encoder|weights|precompute|validate|convert|smoke>
+Usage: $0 <datasets|encoder|weights|precompute|pca|validate|convert|smoke>
 
   datasets   Download LeRobot pick_tube_01..06 from the HF mirror.
   encoder    Download the inference-only encoder from the HF mirror.
   weights    Download latest AT/LDP deployment checkpoints from wjstx/rdp.
   precompute Build tactile embeddings using a separate JAX CUDA environment.
+  pca        Fit two arm-wise 1024-to-15 PCA projections.
   validate   Validate an existing RDP Zarr and load one AT/LDP batch.
   convert    Convert all LeRobot pick_tube_01..06 episodes, then validate.
   smoke      Convert a small subset to SMOKE_DATASET_PATH, then validate.
@@ -52,6 +54,7 @@ Environment variables:
   RDP_MODEL_REVISION  Repository revision (default: main)
   RDP_WEIGHTS_DIR     Local checkpoint directory
   TACTILE_CACHE_ROOT  Root containing KaiyueChen/pick_tube_XX/embeddings.npy
+  TACTILE_PCA_PATH    Two-arm PCA artifact used by conversion and deployment
   DATASET_PATH        Full RDP Zarr output/input directory
   JAX_PYTHON          Python from a separate CUDA-enabled JAX environment
   ENCODER_DIR         Downloaded encoder checkpoint directory
@@ -136,6 +139,13 @@ precompute_tactile() {
       "$@"
 }
 
+fit_tactile_pca() {
+  "${PYTHON_BIN}" fit_pick_tube_tactile_pca.py \
+    --tactile-cache-root "${TACTILE_CACHE_ROOT}" \
+    --output "${TACTILE_PCA_PATH}" \
+    "$@"
+}
+
 validate_dataset() {
   local dataset_path=$1
   if [[ ! -d "${dataset_path}/replay_buffer.zarr" ]]; then
@@ -154,7 +164,7 @@ expected = {
     "camera1": (224, 224, 3),
     "camera2": (224, 224, 3),
     "observation_state": (20,),
-    "tactile_embedding": (2048,),
+    "tactile_embedding": (30,),
     "action": (20,),
 }
 for key, tail in expected.items():
@@ -187,10 +197,15 @@ PY
 convert_dataset() {
   local output_path=$1
   shift
+  if [[ ! -f "${TACTILE_PCA_PATH}" ]]; then
+    echo "Tactile PCA not found: ${TACTILE_PCA_PATH}; run '$0 pca' first." >&2
+    exit 1
+  fi
   local args=(
     --dataset-root "${LEROBOT_ROOT}"
     --tactile-cache-root "${TACTILE_CACHE_ROOT}"
     --output-dir "${output_path}"
+    --tactile-pca-path "${TACTILE_PCA_PATH}"
   )
   if [[ "${OVERWRITE}" == "1" ]]; then
     args+=(--overwrite)
@@ -215,6 +230,9 @@ case "${COMMAND}" in
     ;;
   validate)
     validate_dataset "${DATASET_PATH}"
+    ;;
+  pca)
+    fit_tactile_pca "$@"
     ;;
   convert)
     convert_dataset "${DATASET_PATH}" "$@"

@@ -36,13 +36,21 @@ class FakePolicy:
         assert tuple(obs_dict["camera1"].shape) == (1, 2, 3, 224, 224)
         assert tuple(obs_dict["camera2"].shape) == (1, 2, 3, 224, 224)
         assert tuple(obs_dict["observation_state"].shape) == (1, 2, 20)
-        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, 2048)
+        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, 30)
+        torch.testing.assert_close(
+            obs_dict["tactile_embedding"][0, :, :15],
+            torch.full((2, 15), 1.0 / 255.0),
+        )
+        torch.testing.assert_close(
+            obs_dict["tactile_embedding"][0, :, 15:],
+            torch.full((2, 15), 2.0 / 255.0),
+        )
         assert kwargs["return_latent_action"] is True
         self.slow_observation_states.append(
             obs_dict["observation_state"][0, :, 0].detach().cpu().tolist()
         )
         self.slow_calls += 1
-        return {"action": torch.zeros((1, 29, 64))}
+        return {"action": torch.zeros((1, 29, 128))}
 
     def predict_from_latent_action(
         self,
@@ -51,7 +59,7 @@ class FakePolicy:
         extended_obs_last_step,
         dataset_obs_temporal_downsample_ratio,
     ):
-        assert tuple(latent_action.shape) == (1, 64)
+        assert tuple(latent_action.shape) == (1, 128)
         assert dataset_obs_temporal_downsample_ratio == 2
         history_length = extended_obs["tactile_embedding"].shape[1]
         assert extended_obs_last_step == history_length
@@ -101,10 +109,15 @@ def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
 def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step() -> None:
     policy = FakePolicy()
     encoder = FakeTactileEncoder()
+    means = np.zeros((2, 1024), dtype=np.float32)
+    components = np.zeros((2, 15, 1024), dtype=np.float32)
+    components[:, np.arange(15), np.arange(15)] = 1.0
+    tactile_pca = deploy.BimanualTactilePCA(means, components)
     runtime = deploy.PickTubeRDPRuntime(
         policy,
         encoder,
         torch.device("cpu"),
+        tactile_pca,
         slow_update_interval=5,
         dataset_obs_temporal_downsample_ratio=2,
         n_obs_steps=2,

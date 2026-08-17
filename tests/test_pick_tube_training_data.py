@@ -91,9 +91,22 @@ def test_pick_tube_configs_match_official_rdp_temporal_and_model_defaults():
         assert cfg.checkpoint.topk.monitor_key == "train_loss"
         assert cfg.training.checkpoint_every == 10
         assert cfg.training.val_every == 1
+        assert list(cfg.task.shape_meta.obs.tactile_embedding.shape) == [30]
+        assert list(cfg.task.shape_meta.extended_obs.tactile_embedding.shape) == [30]
+        assert "pca30" in cfg.task.dataset_path
 
-    assert at_cfg.at.policy.n_latent_dims == 8
-    assert at_cfg.at.policy.rnn_latent_dims == 32
+    assert at_cfg.at.policy.n_latent_dims == 16
+    assert at_cfg.at.policy.conv_latent_dims == 32
+    assert at_cfg.at.policy.rnn_latent_dims == 64
+    assert at_cfg.at.policy.n_embed == 32
+    assert ldp_cfg.policy.at.n_latent_dims == 16
+    assert ldp_cfg.policy.at.conv_latent_dims == 32
+    assert ldp_cfg.policy.at.rnn_latent_dims == 64
+    assert ldp_cfg.policy.at.n_embed == 32
+    assert ldp_cfg.task.dataset.at.n_latent_dims == 16
+    assert ldp_cfg.task.dataset.at.conv_latent_dims == 32
+    assert ldp_cfg.task.dataset.at.rnn_latent_dims == 64
+    assert ldp_cfg.task.dataset.at.n_embed == 32
     assert at_cfg.dataloader.batch_size == 64
     assert at_cfg.training.num_epochs == 20
     assert at_cfg.training.checkpoint_every == 10

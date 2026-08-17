@@ -9,13 +9,18 @@ bridge。RDP 只运行在策略机上；机器人机继续运行原服务器进�
 - 官方时序：缓存最近 4 个 30 Hz 原始观测，按 ratio=2 选取 2 帧慢策略观测；
   episode 起始处复制第一帧完成左侧填充，与训练 sampler 一致。
 - 触觉顺序：`left_0, right_0, left_1, right_1`，每路经同一个冻结
-  ResNet18 得到 512 维，拼成 2048 维。
+  ResNet18 得到 512 维；每只手臂的两路 embedding 拼成 1024 维后分别做
+  PCA-15，最终拼成 30 维触觉特征。
 - 慢策略：每 5 个控制周期更新一次 latent plan，默认 8 个 diffusion steps。
 - 快策略：每个观测周期都用累计触觉历史解码当前一步。
 - 动作：每次只向机器人发送 `[1,20]`，服务器按每臂连续 10 维的相对动作
   contract 转换为绝对 waypoint。
 - RDP 不使用 SmolVLA 的 RTC chunk 消费；服务器在收到单步动作后以
   `now + 0.01s` 调度，避免网络推理耗时使动作天然过期。
+
+> PCA-30 会改变策略输入维度。原先使用 2048 维触觉 embedding 训练的
+> AT/LDP checkpoint 不能直接部署，需要重新生成数据并训练新 checkpoint。
+
 
 ## 1. 策略机环境
 
@@ -67,6 +72,7 @@ model:
   at_checkpoint: data/weights/wjstx_rdp/at_20260813_115524/checkpoints/latest.ckpt
   tactile_encoder_dir: /absolute/path/to/encoder_ckpt_0809
   device: cuda:0
+  tactile_pca_path: data/PCA_Transform_PickTube/tactile_pca_2x15.npz
   num_inference_steps: 8
 
 connection:

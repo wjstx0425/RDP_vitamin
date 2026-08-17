@@ -3,7 +3,7 @@ set -euo pipefail
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 GPU_ID=${GPU_ID:-0}
-DATASET_PATH=${DATASET_PATH:-data/pick_tube_01_06_rdp_zarr}
+DATASET_PATH=${DATASET_PATH:-data/pick_tube_01_06_pca30_rdp_zarr}
 OUTPUT_ROOT=${OUTPUT_ROOT:-data/outputs/pick_tube}
 LOGGING_MODE=${LOGGING_MODE:-online}
 STAGE=${1:-all}

@@ -20,6 +20,10 @@ from omegaconf import OmegaConf
 
 from reactive_diffusion_policy.deploy.bridge_client import RobotBridgeClient
 from reactive_diffusion_policy.deploy.tactile_encoder_torch import load_tactile_resnet18
+from reactive_diffusion_policy.model.tactile_pca import (
+    BimanualTactilePCA,
+    REDUCED_TACTILE_DIM,
+)
 
 
 CAMERA_KEYS = ("observation.images.camera0", "observation.images.camera1")
@@ -69,6 +73,13 @@ def load_policy(
         )
     cfg = copy.deepcopy(payload["cfg"])
     OmegaConf.set_struct(cfg, False)
+    checkpoint_tactile_dim = int(cfg.shape_meta.obs.tactile_embedding.shape[0])
+    if checkpoint_tactile_dim != REDUCED_TACTILE_DIM:
+        raise ValueError(
+            f"LDP checkpoint expects {checkpoint_tactile_dim}D tactile embeddings; "
+            f"the PCA deployment requires {REDUCED_TACTILE_DIM}D. "
+            "Retrain AT and LDP with the PCA30 task configs."
+        )
     cfg.at_load_dir = str(at_checkpoint)
     cfg.policy.at.load_dir = str(at_checkpoint)
     cfg.policy.at.device = str(device)
@@ -103,6 +114,7 @@ class PickTubeRDPRuntime:
         policy,
         tactile_encoder,
         device: torch.device,
+        tactile_pca,
         slow_update_interval: int,
         dataset_obs_temporal_downsample_ratio: int,
         n_obs_steps: int,
@@ -114,6 +126,7 @@ class PickTubeRDPRuntime:
         self.policy = policy
         self.tactile_encoder = tactile_encoder
         self.device = device
+        self.tactile_pca = tactile_pca
         self.slow_update_interval = slow_update_interval
         self.temporal_downsample_ratio = dataset_obs_temporal_downsample_ratio
         self.n_obs_steps = n_obs_steps
@@ -144,9 +157,14 @@ class PickTubeRDPRuntime:
         camera_tensor = camera_tensor.permute(0, 3, 1, 2).float().mul_(1.0 / 255.0)
         tactile_tensor = torch.from_numpy(np.stack(tactile_images)).to(self.device)
         tactile_tensor = tactile_tensor.permute(0, 3, 1, 2).float().mul_(1.0 / 255.0)
-        tactile_embedding = self.tactile_encoder(tactile_tensor).reshape(1, 1, -1)
-        if tactile_embedding.shape[-1] != 2048:
-            raise RuntimeError(f"Expected 2048D tactile embedding, got {tactile_embedding.shape}")
+        raw_tactile_embedding = self.tactile_encoder(tactile_tensor)
+        if raw_tactile_embedding.shape != (4, 512):
+            raise RuntimeError(
+                f"Expected four 512D tactile embeddings, got {raw_tactile_embedding.shape}"
+            )
+        tactile_embedding = self.tactile_pca(raw_tactile_embedding).reshape(1, 1, -1)
+        if tactile_embedding.shape[-1] != REDUCED_TACTILE_DIM:
+            raise RuntimeError(f"Expected 30D tactile embedding, got {tactile_embedding.shape}")
 
         obs_dict = {
             "camera1": camera_tensor[0].reshape(1, 1, 3, IMAGE_SIZE, IMAGE_SIZE),
@@ -242,7 +260,8 @@ def run(config_path: Path, device_override: str | None = None) -> None:
     ldp_checkpoint = resolve_path(str(model_config["ldp_checkpoint"]))
     at_checkpoint = resolve_path(str(model_config["at_checkpoint"]))
     encoder_dir = resolve_path(str(model_config["tactile_encoder_dir"]))
-    missing = [path for path in (ldp_checkpoint, at_checkpoint) if not path.is_file()]
+    tactile_pca_path = resolve_path(str(model_config["tactile_pca_path"]))
+    missing = [path for path in (ldp_checkpoint, at_checkpoint, tactile_pca_path) if not path.is_file()]
     if not encoder_dir.is_dir():
         missing.append(encoder_dir)
     if missing:
@@ -257,10 +276,12 @@ def run(config_path: Path, device_override: str | None = None) -> None:
         int(model_config.get("num_inference_steps", 8)),
     )
     tactile_encoder = load_tactile_resnet18(encoder_dir, device=device)
+    tactile_pca = BimanualTactilePCA.from_npz(tactile_pca_path, device=device)
     rdp = PickTubeRDPRuntime(
         policy,
         tactile_encoder,
         device,
+        tactile_pca,
         slow_update_interval=int(control.get("slow_update_interval", 5)),
         dataset_obs_temporal_downsample_ratio=int(
             checkpoint_cfg.dataset_obs_temporal_downsample_ratio
