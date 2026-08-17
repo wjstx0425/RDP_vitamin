@@ -33,3 +33,24 @@ def test_negative_epoch_target_is_rejected():
 
     with pytest.raises(ValueError, match="non-negative"):
         workspace.get_remaining_epochs(-1)
+
+
+def test_checkpoint_schedule_always_saves_final_epoch():
+    workspace = BaseWorkspace(cfg=None)
+
+    workspace.epoch = 0
+    assert workspace.should_save_checkpoint(10, local_epoch_idx=0, num_epochs_to_run=10)
+
+    workspace.epoch = 1
+    assert not workspace.should_save_checkpoint(10, local_epoch_idx=0, num_epochs_to_run=9)
+
+    workspace.epoch = 9
+    assert workspace.should_save_checkpoint(10, local_epoch_idx=8, num_epochs_to_run=9)
+
+
+def test_checkpoint_schedule_rejects_invalid_interval():
+    workspace = BaseWorkspace(cfg=None)
+    workspace.epoch = 0
+
+    with pytest.raises(ValueError, match="positive"):
+        workspace.should_save_checkpoint(0, local_epoch_idx=0, num_epochs_to_run=1)

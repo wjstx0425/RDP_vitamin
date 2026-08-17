@@ -34,6 +34,20 @@ class BaseWorkspace:
             raise ValueError("target_num_epochs must be non-negative")
         return max(0, target_num_epochs - int(self.epoch))
 
+    def should_save_checkpoint(self, checkpoint_every, local_epoch_idx, num_epochs_to_run):
+        """Save on the configured cadence and after the final requested epoch."""
+        checkpoint_every = int(checkpoint_every)
+        local_epoch_idx = int(local_epoch_idx)
+        num_epochs_to_run = int(num_epochs_to_run)
+        if checkpoint_every < 1:
+            raise ValueError("checkpoint_every must be positive")
+        if num_epochs_to_run < 1 or not 0 <= local_epoch_idx < num_epochs_to_run:
+            raise ValueError("local_epoch_idx must identify an epoch in this run")
+        return (
+            int(self.epoch) % checkpoint_every == 0
+            or local_epoch_idx == num_epochs_to_run - 1
+        )
+
     @property
     def output_dir(self):
         output_dir = self._output_dir

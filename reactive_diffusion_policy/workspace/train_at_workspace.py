@@ -266,7 +266,11 @@ class TrainATWorkspace(BaseWorkspace):
                                 step_log['val_kl_loss'] = np.mean(val_kl_loss)
 
                 # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0:
+                if self.should_save_checkpoint(
+                    cfg.training.checkpoint_every,
+                    local_epoch_idx,
+                    num_epochs_to_run,
+                ):
                     # checkpointing
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()

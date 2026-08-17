@@ -367,7 +367,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 accelerator.wait_for_everyone()
                 
                 # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
+                if self.should_save_checkpoint(
+                    cfg.training.checkpoint_every,
+                    local_epoch_idx,
+                    num_epochs_to_run,
+                ) and accelerator.is_main_process:
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
