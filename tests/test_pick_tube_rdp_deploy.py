@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from omegaconf import OmegaConf
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,34 @@ def observation(step: int = 0) -> dict:
     for value, key in enumerate(deploy.TACTILE_KEYS, start=1):
         result[key] = np.full((224, 224, 3), value, dtype=np.uint8)
     return result
+
+
+def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
+    config = OmegaConf.create(
+        {
+            "policy": {
+                "obs_encoder": {
+                    "random_transforms": [
+                        {"type": "RandomCrop", "ratio": 0.9},
+                        {
+                            "type": "ColorJitter",
+                            "brightness": 0.25,
+                            "contrast": 0.25,
+                            "saturation": 0.15,
+                            "hue": 0.03,
+                        },
+                    ]
+                }
+            }
+        }
+    )
+
+    deploy.prepare_inference_config(config)
+
+    assert OmegaConf.to_container(
+        config.policy.obs_encoder.random_transforms,
+        resolve=True,
+    ) == [{"type": "RandomCrop", "ratio": 0.9}]
 
 
 def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step() -> None:

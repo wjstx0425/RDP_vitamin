@@ -48,6 +48,12 @@ def resolve_path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def prepare_inference_config(cfg: Any) -> None:
+    transforms = cfg.policy.obs_encoder.get("random_transforms")
+    if transforms and transforms[0].get("type") == "RandomCrop":
+        cfg.policy.obs_encoder.random_transforms = [transforms[0]]
+
+
 def load_policy(
     ldp_checkpoint: Path,
     at_checkpoint: Path,
@@ -66,6 +72,7 @@ def load_policy(
     cfg.at_load_dir = str(at_checkpoint)
     cfg.policy.at.load_dir = str(at_checkpoint)
     cfg.policy.at.device = str(device)
+    prepare_inference_config(cfg)
 
     workspace_class = hydra.utils.get_class(cfg._target_)
     workspace = workspace_class(cfg)

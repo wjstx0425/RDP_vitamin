@@ -1,8 +1,8 @@
 task: pick up two tubes
 
 model:
-  ldp_checkpoint: data/weights/wjstx_rdp/ldp_20260813_214114/checkpoints/latest.ckpt
-  at_checkpoint: data/weights/wjstx_rdp/at_20260813_115524/checkpoints/latest.ckpt
+  ldp_checkpoint: /home/typhon/RDP_vitamin/data/weights/wjstx_rdp/pick_tube_01_06/pick_tube_01_06/ldp_rdp0106_ldp_b32w8_20260816/checkpoints/epoch=0009-val_loss=0.025.ckpt
+  at_checkpoint: /home/typhon/RDP_vitamin/data/weights/wjstx_rdp/pick_tube_01_06/at_rdp0106_full_20260816/checkpoints/latest.ckpt
   tactile_encoder_dir: data/encoder_ckpt_0809
   device: cuda:0
   num_inference_steps: 8
