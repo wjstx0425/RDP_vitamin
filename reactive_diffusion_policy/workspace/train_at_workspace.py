@@ -56,11 +56,18 @@ class TrainATWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         # resume training
+        resumed = False
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                self.advance_training_state_for_resume()
+                resumed = True
+                print(
+                    f"Continuing at epoch {self.epoch}, "
+                    f"global step {self.global_step}"
+                )
 
         # configure dataset
         dataset: BaseImageDataset
@@ -122,10 +129,17 @@ class TrainATWorkspace(BaseWorkspace):
             cfg.training.checkpoint_every = 1
             cfg.training.val_every = 1
 
+        num_epochs_to_run = self.get_remaining_epochs(cfg.training.num_epochs)
+        if resumed:
+            print(
+                f"Remaining epochs: {num_epochs_to_run} "
+                f"(target total: {cfg.training.num_epochs})"
+            )
+
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            for local_epoch_idx in range(num_epochs_to_run):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 train_losses = list()

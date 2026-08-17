@@ -98,22 +98,25 @@ class PickTubeRDPRuntime:
         device: torch.device,
         slow_update_interval: int,
         dataset_obs_temporal_downsample_ratio: int,
+        n_obs_steps: int,
     ) -> None:
         if slow_update_interval < 1:
             raise ValueError("slow_update_interval must be positive")
-        if dataset_obs_temporal_downsample_ratio != 1:
-            raise ValueError("The pick-tube deployment requires temporal downsample ratio 1")
+        if dataset_obs_temporal_downsample_ratio < 1 or n_obs_steps < 1:
+            raise ValueError("Observation steps and temporal downsample ratio must be positive")
         self.policy = policy
         self.tactile_encoder = tactile_encoder
         self.device = device
         self.slow_update_interval = slow_update_interval
         self.temporal_downsample_ratio = dataset_obs_temporal_downsample_ratio
+        self.n_obs_steps = n_obs_steps
         self.reset()
 
     def reset(self) -> None:
         self.step = 0
         self.latent_action: torch.Tensor | None = None
         self.tactile_history: list[torch.Tensor] = []
+        self.observation_history: list[dict[str, torch.Tensor]] = []
 
     def _prepare_observation(
         self, observation: dict[str, Any]
@@ -146,18 +149,54 @@ class PickTubeRDPRuntime:
         }
         return obs_dict, tactile_embedding
 
+    def _padded_observation_history(self) -> list[dict[str, torch.Tensor]]:
+        raw_steps = self.n_obs_steps * self.temporal_downsample_ratio
+        history = self.observation_history[-raw_steps:]
+        if not history:
+            raise RuntimeError("Observation history is empty")
+
+        if len(history) < raw_steps:
+            history = [history[0]] * (raw_steps - len(history)) + history
+        return history
+
+    def _slow_policy_observation(self) -> dict[str, torch.Tensor]:
+        """Build the same temporally-downsampled history used by the dataset."""
+        history = self._padded_observation_history()
+
+        # The dataset selects [1, 3] from a four-frame window when ratio=2.
+        selected = history[self.temporal_downsample_ratio - 1::self.temporal_downsample_ratio]
+        if len(selected) != self.n_obs_steps:
+            raise RuntimeError(
+                f"Expected {self.n_obs_steps} slow observations, got {len(selected)}"
+            )
+        return {
+            key: torch.cat([frame[key] for frame in selected], dim=1)
+            for key in selected[0]
+        }
+
     @torch.inference_mode()
     def predict(self, observation: dict[str, Any]) -> tuple[np.ndarray, bool]:
-        obs_dict, tactile_embedding = self._prepare_observation(observation)
+        current_obs, tactile_embedding = self._prepare_observation(observation)
+        self.observation_history.append(current_obs)
+        raw_steps = self.n_obs_steps * self.temporal_downsample_ratio
+        if len(self.observation_history) > raw_steps:
+            self.observation_history = self.observation_history[-raw_steps:]
+
         slow_update = self.latent_action is None or self.step % self.slow_update_interval == 0
         if slow_update:
+            obs_dict = self._slow_policy_observation()
             result = self.policy.predict_action(
                 obs_dict,
                 dataset_obs_temporal_downsample_ratio=self.temporal_downsample_ratio,
                 return_latent_action=True,
             )
             self.latent_action = result["action"][:, 0].detach()
-            self.tactile_history = [tactile_embedding]
+            # Match the official runner: start decoding with the complete raw
+            # observation window, then extend it once per control step.
+            self.tactile_history = [
+                frame["tactile_embedding"]
+                for frame in self._padded_observation_history()
+            ]
         else:
             self.tactile_history.append(tactile_embedding)
 
@@ -219,6 +258,7 @@ def run(config_path: Path, device_override: str | None = None) -> None:
         dataset_obs_temporal_downsample_ratio=int(
             checkpoint_cfg.dataset_obs_temporal_downsample_ratio
         ),
+        n_obs_steps=int(checkpoint_cfg.n_obs_steps),
     )
 
     bridge = RobotBridgeClient(

@@ -18,10 +18,10 @@ HF_MAX_WORKERS=${HF_MAX_WORKERS:-4}
 RDP_MODEL_REPO=${RDP_MODEL_REPO:-wjstx/rdp}
 RDP_MODEL_REVISION=${RDP_MODEL_REVISION:-main}
 RDP_WEIGHTS_DIR=${RDP_WEIGHTS_DIR:-${RDP_DIR}/data/weights/wjstx_rdp}
-LEROBOT_ROOT=${LEROBOT_ROOT:-/DATA/ljl/substage}
+LEROBOT_ROOT=${LEROBOT_ROOT:-/home/hillbot/datasets}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
-DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_rdp_zarr}
-SMOKE_DATASET_PATH=${SMOKE_DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_smoke_rdp_zarr}
+DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_rdp_zarr}
+SMOKE_DATASET_PATH=${SMOKE_DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_smoke_rdp_zarr}
 ENCODER_DIR=${ENCODER_DIR:-${RDP_DIR}/data/encoder_ckpt_0809}
 ENCODER_RELEASE_BASE=${ENCODER_RELEASE_BASE:-https://alpha.hf-mirror.com/KaiyueChen/encoder_ckpt_0809/resolve/main}
 ENCODER_PARAMS_FILE=params-235cb754d17b461b8be2d652c96fc169.npz
@@ -33,17 +33,17 @@ usage() {
   cat <<USAGE
 Usage: $0 <datasets|encoder|weights|precompute|validate|convert|smoke>
 
-  datasets   Download LeRobot pick_tube_01..04 from the HF mirror.
+  datasets   Download LeRobot pick_tube_01..06 from the HF mirror.
   encoder    Download the inference-only encoder from the HF mirror.
   weights    Download latest AT/LDP deployment checkpoints from wjstx/rdp.
   precompute Build tactile embeddings using a separate JAX CUDA environment.
   validate   Validate an existing RDP Zarr and load one AT/LDP batch.
-  convert    Convert all LeRobot pick_tube_01..04 episodes, then validate.
+  convert    Convert all LeRobot pick_tube_01..06 episodes, then validate.
   smoke      Convert a small subset to SMOKE_DATASET_PATH, then validate.
 
 Environment variables:
-  LEROBOT_ROOT        LeRobot root containing pick_tube_01..04
-                      (default: /DATA/ljl/substage)
+  LEROBOT_ROOT        LeRobot root containing pick_tube_01..06
+                      (default: /home/hillbot/datasets)
   HF_ENDPOINT         Hugging Face endpoint (default: alpha.hf-mirror.com)
   HF_HUB_DISABLE_XET  Disable Xet CAS downloads (default: 1)
   HF_HUB_DOWNLOAD_TIMEOUT  Per-file HTTP timeout in seconds (default: 60)
@@ -62,7 +62,7 @@ USAGE
 
 download_datasets() {
   mkdir -p "${LEROBOT_ROOT}"
-  for dataset_name in pick_tube_01 pick_tube_02 pick_tube_03 pick_tube_04; do
+  for dataset_name in pick_tube_01 pick_tube_02 pick_tube_03 pick_tube_04 pick_tube_05 pick_tube_06; do
     echo "Downloading KaiyueChen/${dataset_name} to ${LEROBOT_ROOT}/${dataset_name}"
     HF_ENDPOINT="${HF_ENDPOINT}" \
       HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET}" \
@@ -167,7 +167,18 @@ if len(lengths) != 1:
 episode_ends = root["meta"]["episode_ends"][:]
 if len(episode_ends) == 0 or int(episode_ends[-1]) != next(iter(lengths)):
     raise SystemExit("episode_ends does not match frame count")
-print(f"contract OK: episodes={len(episode_ends)}, frames={int(episode_ends[-1])}")
+episode_repeats = root["meta"]["episode_repeats"][:]
+if episode_repeats.shape != episode_ends.shape or (episode_repeats < 1).any():
+    raise SystemExit("episode_repeats must be positive and aligned with episode_ends")
+starts = [0, *episode_ends[:-1]]
+effective_frames = sum(
+    (int(end) - int(start)) * int(repeat)
+    for start, end, repeat in zip(starts, episode_ends, episode_repeats)
+)
+print(
+    f"contract OK: episodes={len(episode_ends)}, physical_frames={int(episode_ends[-1])}, "
+    f"effective_training_frames={effective_frames}"
+)
 PY
   "${PYTHON_BIN}" validate_pick_tube_batch.py "${dataset_path}" --mode at --batch-size 2
   "${PYTHON_BIN}" validate_pick_tube_batch.py "${dataset_path}" --mode ldp --batch-size 2

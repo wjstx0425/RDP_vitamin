@@ -29,15 +29,19 @@ class FakePolicy:
     def __init__(self) -> None:
         self.slow_calls = 0
         self.fast_history_lengths = []
+        self.slow_observation_states = []
 
     def predict_action(self, obs_dict, **kwargs):
-        assert tuple(obs_dict["camera1"].shape) == (1, 1, 3, 224, 224)
-        assert tuple(obs_dict["camera2"].shape) == (1, 1, 3, 224, 224)
-        assert tuple(obs_dict["observation_state"].shape) == (1, 1, 20)
-        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 1, 2048)
+        assert tuple(obs_dict["camera1"].shape) == (1, 2, 3, 224, 224)
+        assert tuple(obs_dict["camera2"].shape) == (1, 2, 3, 224, 224)
+        assert tuple(obs_dict["observation_state"].shape) == (1, 2, 20)
+        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, 2048)
         assert kwargs["return_latent_action"] is True
+        self.slow_observation_states.append(
+            obs_dict["observation_state"][0, :, 0].detach().cpu().tolist()
+        )
         self.slow_calls += 1
-        return {"action": torch.zeros((1, 10, 160))}
+        return {"action": torch.zeros((1, 29, 64))}
 
     def predict_from_latent_action(
         self,
@@ -46,19 +50,19 @@ class FakePolicy:
         extended_obs_last_step,
         dataset_obs_temporal_downsample_ratio,
     ):
-        assert tuple(latent_action.shape) == (1, 160)
-        assert dataset_obs_temporal_downsample_ratio == 1
+        assert tuple(latent_action.shape) == (1, 64)
+        assert dataset_obs_temporal_downsample_ratio == 2
         history_length = extended_obs["tactile_embedding"].shape[1]
         assert extended_obs_last_step == history_length
         self.fast_history_lengths.append(history_length)
         return {"action": torch.full((1, history_length, 20), float(history_length))}
 
 
-def observation() -> dict:
+def observation(step: int = 0) -> dict:
     result = {
         "observation.images.camera0": np.zeros((224, 224, 3), dtype=np.uint8),
         "observation.images.camera1": np.zeros((224, 224, 3), dtype=np.uint8),
-        "observation.state": np.zeros(20, dtype=np.float32),
+        "observation.state": np.full(20, step, dtype=np.float32),
     }
     for value, key in enumerate(deploy.TACTILE_KEYS, start=1):
         result[key] = np.full((224, 224, 3), value, dtype=np.uint8)
@@ -73,18 +77,20 @@ def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step() -> 
         encoder,
         torch.device("cpu"),
         slow_update_interval=5,
-        dataset_obs_temporal_downsample_ratio=1,
+        dataset_obs_temporal_downsample_ratio=2,
+        n_obs_steps=2,
     )
 
     slow_updates = []
     actions = []
-    for _ in range(7):
-        action, slow_update = runtime.predict(observation())
+    for step in range(7):
+        action, slow_update = runtime.predict(observation(step))
         actions.append(action)
         slow_updates.append(slow_update)
 
     assert slow_updates == [True, False, False, False, False, True, False]
     assert policy.slow_calls == 2
-    assert policy.fast_history_lengths == [1, 2, 3, 4, 5, 1, 2]
+    assert policy.slow_observation_states == [[0.0, 0.0], [3.0, 5.0]]
+    assert policy.fast_history_lengths == [4, 5, 6, 7, 8, 4, 5]
     assert all(action.shape == (1, 20) and action.dtype == np.float32 for action in actions)
     np.testing.assert_allclose(encoder.last_means, np.arange(1, 5) / 255.0)

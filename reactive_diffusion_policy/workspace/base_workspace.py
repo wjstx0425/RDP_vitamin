@@ -17,6 +17,23 @@ class BaseWorkspace:
         self._output_dir = output_dir
         self._saving_thread = None
 
+    def advance_training_state_for_resume(self):
+        """Advance counters stored by end-of-epoch checkpoints.
+
+        Training checkpoints are saved after the last optimizer step of an
+        epoch, but before global_step and epoch are incremented. A resumed run
+        must therefore start at the following step and epoch.
+        """
+        self.global_step = int(self.global_step) + 1
+        self.epoch = int(self.epoch) + 1
+
+    def get_remaining_epochs(self, target_num_epochs):
+        """Return epochs left when target_num_epochs is a total target."""
+        target_num_epochs = int(target_num_epochs)
+        if target_num_epochs < 0:
+            raise ValueError("target_num_epochs must be non-negative")
+        return max(0, target_num_epochs - int(self.epoch))
+
     @property
     def output_dir(self):
         output_dir = self._output_dir

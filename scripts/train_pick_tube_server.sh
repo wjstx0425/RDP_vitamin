@@ -9,8 +9,8 @@ STAGE=${1:-help}
 PROFILE=${2:-4090}
 PYTHON_BIN=${PYTHON_BIN:-${RDP_DIR}/.venv/bin/python}
 ACCELERATE_BIN=${ACCELERATE_BIN:-${RDP_DIR}/.venv/bin/accelerate}
-DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_04_rdp_zarr}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${RDP_DIR}/data/outputs/pick_tube}
+DATASET_PATH=${DATASET_PATH:-${RDP_DIR}/data/pick_tube_01_06_rdp_zarr}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${RDP_DIR}/data/outputs/pick_tube_01_06}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
 LOGGING_MODE=${LOGGING_MODE:-offline}
 DRY_RUN=${DRY_RUN:-0}
@@ -37,15 +37,15 @@ case "${PROFILE}" in
     GPU_IDS=${GPU_IDS:-0}
     LDP_PROCESSES=1
     AT_BATCH=${AT_BATCH:-64}
-    LDP_BATCH=${LDP_BATCH:-8}
-    NUM_WORKERS=${NUM_WORKERS:-4}
+    LDP_BATCH=${LDP_BATCH:-64}
+    NUM_WORKERS=${NUM_WORKERS:-8}
     ;;
   rtxpro6000x2)
     GPU_IDS=${GPU_IDS:-0,1}
     LDP_PROCESSES=2
     AT_BATCH=${AT_BATCH:-64}
-    LDP_BATCH=${LDP_BATCH:-16}
-    NUM_WORKERS=${NUM_WORKERS:-4}
+    LDP_BATCH=${LDP_BATCH:-64}
+    NUM_WORKERS=${NUM_WORKERS:-8}
     ;;
   *)
     usage >&2
@@ -55,8 +55,6 @@ esac
 
 AT_EPOCHS=${AT_EPOCHS:-20}
 LDP_EPOCHS=${LDP_EPOCHS:-10}
-AT_CHECKPOINT_EVERY=${AT_CHECKPOINT_EVERY:-2}
-LDP_CHECKPOINT_EVERY=${LDP_CHECKPOINT_EVERY:-1}
 AT_DIR=${AT_DIR:-${OUTPUT_ROOT}/at_${RUN_ID}}
 LDP_DIR=${LDP_DIR:-${OUTPUT_ROOT}/ldp_${RUN_ID}}
 AT_STATE=${OUTPUT_ROOT}/latest_at_checkpoint.txt
@@ -88,8 +86,6 @@ train_at() {
     "hydra.run.dir=${AT_DIR}"
     "logging.mode=${LOGGING_MODE}"
     "training.num_epochs=${AT_EPOCHS}"
-    "training.checkpoint_every=${AT_CHECKPOINT_EVERY}"
-    "training.val_every=${AT_CHECKPOINT_EVERY}"
     "dataloader.batch_size=${AT_BATCH}"
     "val_dataloader.batch_size=${AT_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"
@@ -136,7 +132,6 @@ train_ldp() {
   local launch=(
     env "CUDA_VISIBLE_DEVICES=${GPU_IDS}"
     "${ACCELERATE_BIN}" launch
-    --mixed_precision bf16
     --num_processes "${LDP_PROCESSES}"
     --num_machines 1
     --dynamo_backend no
@@ -152,8 +147,6 @@ train_ldp() {
     "hydra.run.dir=${LDP_DIR}"
     "logging.mode=${LOGGING_MODE}"
     "training.num_epochs=${LDP_EPOCHS}"
-    "training.checkpoint_every=${LDP_CHECKPOINT_EVERY}"
-    "training.val_every=${LDP_CHECKPOINT_EVERY}"
     "dataloader.batch_size=${LDP_BATCH}"
     "val_dataloader.batch_size=${LDP_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"

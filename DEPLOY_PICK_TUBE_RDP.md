@@ -6,6 +6,8 @@ bridge。RDP 只运行在策略机上；机器人机继续运行原服务器进�
 ## 运行 contract
 
 - 观测：两路 224×224 RGB、四路 224×224 触觉 RGB、20 维 state。
+- 官方时序：缓存最近 4 个 30 Hz 原始观测，按 ratio=2 选取 2 帧慢策略观测；
+  episode 起始处复制第一帧完成左侧填充，与训练 sampler 一致。
 - 触觉顺序：`left_0, right_0, left_1, right_1`，每路经同一个冻结
   ResNet18 得到 512 维，拼成 2048 维。
 - 慢策略：每 5 个控制周期更新一次 latent plan，默认 8 个 diffusion steps。

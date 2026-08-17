@@ -16,7 +16,15 @@ from numcodecs import Blosc
 from PIL import Image
 
 
-DEFAULT_DATASETS = ("pick_tube_01", "pick_tube_02", "pick_tube_03", "pick_tube_04")
+DEFAULT_DATASETS = (
+    "pick_tube_01",
+    "pick_tube_02",
+    "pick_tube_03",
+    "pick_tube_04",
+    "pick_tube_05",
+    "pick_tube_06",
+)
+DEFAULT_DATASET_REPEATS = ("pick_tube_05=2", "pick_tube_06=2")
 CAMERA_KEYS = ("observation.images.camera0", "observation.images.camera1")
 STATE_KEY = "observation.state"
 ACTION_KEY = "actions"
@@ -45,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
     parser.add_argument(
+        "--dataset-repeats",
+        nargs="*",
+        default=list(DEFAULT_DATASET_REPEATS),
+        metavar="DATASET=REPEAT",
+        help="Training-only episode repeat factors stored as Zarr metadata.",
+    )
+    parser.add_argument(
         "--max-episodes-per-dataset",
         type=int,
         default=None,
@@ -52,6 +67,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def parse_dataset_repeats(items: list[str]) -> dict[str, int]:
+    repeats: dict[str, int] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"invalid repeat specification {item!r}; expected DATASET=REPEAT")
+        dataset, value = item.rsplit("=", 1)
+        repeat = int(value)
+        if repeat < 1:
+            raise ValueError(f"repeat factor must be positive, got {item!r}")
+        repeats[dataset] = repeat
+    return repeats
 
 
 def load_episode_lengths(dataset_dir: Path) -> tuple[list[dict], dict[int, int]]:
@@ -120,6 +148,7 @@ def create_output(path: Path) -> tuple[zarr.Group, dict[str, zarr.Array]]:
 
 def main() -> None:
     args = parse_args()
+    dataset_repeats = parse_dataset_repeats(args.dataset_repeats)
     zarr_path = args.output_dir / "replay_buffer.zarr"
     if zarr_path.exists():
         if not args.overwrite:
@@ -129,9 +158,11 @@ def main() -> None:
 
     root, arrays = create_output(zarr_path)
     episode_ends: list[int] = []
+    episode_repeats: list[int] = []
+    episode_dataset_ids: list[int] = []
     total_frames = 0
 
-    for dataset_name in args.datasets:
+    for dataset_id, dataset_name in enumerate(args.datasets):
         dataset_dir = args.dataset_root / dataset_name
         records, offsets = load_episode_lengths(dataset_dir)
         cache_path = args.tactile_cache_root / "KaiyueChen" / dataset_name / "embeddings.npy"
@@ -173,6 +204,8 @@ def main() -> None:
                 append(arrays[key], values)
             total_frames += expected_length
             episode_ends.append(total_frames)
+            episode_repeats.append(dataset_repeats.get(dataset_name, 1))
+            episode_dataset_ids.append(dataset_id)
             print(f"{dataset_name} episode {episode_index}: {expected_length} frames -> total {total_frames}", flush=True)
 
     root["meta"].create_dataset(
@@ -181,7 +214,28 @@ def main() -> None:
         chunks=(max(1, min(1024, len(episode_ends))),),
         compressor=None,
     )
-    print(f"wrote {len(episode_ends)} episodes / {total_frames} frames to {zarr_path}")
+    root["meta"].create_dataset(
+        "episode_repeats",
+        data=np.asarray(episode_repeats, dtype=np.int16),
+        chunks=(max(1, min(1024, len(episode_repeats))),),
+        compressor=None,
+    )
+    root["meta"].create_dataset(
+        "episode_dataset_ids",
+        data=np.asarray(episode_dataset_ids, dtype=np.int16),
+        chunks=(max(1, min(1024, len(episode_dataset_ids))),),
+        compressor=None,
+    )
+    root["meta"].attrs["dataset_names"] = list(args.datasets)
+    starts = [0, *episode_ends[:-1]]
+    effective_frames = sum(
+        (end - start) * repeat
+        for start, end, repeat in zip(starts, episode_ends, episode_repeats)
+    )
+    print(
+        f"wrote {len(episode_ends)} episodes / {total_frames} physical frames / "
+        f"{effective_frames} effective training frames to {zarr_path}"
+    )
 
 
 if __name__ == "__main__":

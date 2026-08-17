@@ -2,6 +2,7 @@ from typing import Dict
 import torch
 import numpy as np
 import os
+import zarr
 from threadpoolctl import threadpool_limits
 import copy
 import tqdm
@@ -29,6 +30,7 @@ class RealImageTactileDataset(BaseImageDataset):
                  seed=42,
                  val_ratio=0.0,
                  max_train_episodes=None,
+                 use_episode_repeats=True,
                  delta_action=False,
                  relative_action=False,
                  relative_tcp_obs_for_relative_action=True,
@@ -113,12 +115,19 @@ class RealImageTactileDataset(BaseImageDataset):
             max_n=max_train_episodes, 
             seed=seed)
 
+        episode_repeats = None
+        if use_episode_repeats:
+            zarr_root = zarr.open_group(zarr_path, mode="r")
+            if "episode_repeats" in zarr_root["meta"]:
+                episode_repeats = zarr_root["meta"]["episode_repeats"][:]
+
         sampler = SequenceSampler(
             replay_buffer=replay_buffer, 
             sequence_length=horizon+n_latency_steps,
             pad_before=pad_before, 
             pad_after=pad_after,
             episode_mask=train_mask,
+            episode_repeats=episode_repeats,
             key_first_k=key_first_k)
         
         self.replay_buffer = replay_buffer
@@ -132,6 +141,7 @@ class RealImageTactileDataset(BaseImageDataset):
         self.obs_downsample_ratio = obs_temporal_downsample_ratio
         self.val_mask = val_mask
         self.train_mask = train_mask
+        self.episode_repeats = episode_repeats
         self.horizon = horizon
         self.n_latency_steps = n_latency_steps
         self.pad_before = pad_before
@@ -144,7 +154,11 @@ class RealImageTactileDataset(BaseImageDataset):
             sequence_length=self.horizon+self.n_latency_steps,
             pad_before=self.pad_before,
             pad_after=self.pad_after,
-            episode_mask=self.val_mask
+            episode_mask=self.val_mask,
+            # Match the training sampler's I/O optimization. Validation does
+            # not apply episode_repeats because oversampling is a training-only
+            # weighting, but it should still avoid reading unused RGB frames.
+            key_first_k=self.key_first_k,
             )
         val_set.val_mask = ~self.val_mask
         return val_set
