@@ -12,3 +12,4 @@ policy:
 # larger dataset.
 training:
   num_epochs: 10
+  checkpoint_every: 2
