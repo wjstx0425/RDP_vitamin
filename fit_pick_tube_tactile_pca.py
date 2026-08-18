@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit two 1024-to-15 PCA projections from cached tactile embeddings."""
+"""Fit two arm-wise PCA projections from cached tactile embeddings."""
 
 from __future__ import annotations
 
@@ -35,22 +35,28 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/PCA_Transform_PickTube/tactile_pca_2x15.npz"),
     )
     parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
+    parser.add_argument(
+        "--components-per-arm",
+        type=int,
+        default=COMPONENTS_PER_ARM,
+        help="PCA components retained for each arm (total output is twice this value).",
+    )
     parser.add_argument("--batch-size", type=int, default=4096)
     return parser.parse_args()
 
 
-def iter_batches(path: Path, batch_size: int):
+def iter_batches(path: Path, batch_size: int, components_per_arm: int):
     values = np.load(path, mmap_mode="r", allow_pickle=False)
     if values.ndim != 3 or values.shape[1:] != (len(TACTILE_SENSOR_ORDER), 512):
         raise ValueError(f"{path}: expected [N,4,512], got {values.shape}")
-    if values.shape[0] < COMPONENTS_PER_ARM:
+    if values.shape[0] < components_per_arm:
         raise ValueError(
-            f"{path}: PCA requires at least {COMPONENTS_PER_ARM} samples, got {values.shape[0]}"
+            f"{path}: PCA requires at least {components_per_arm} samples, got {values.shape[0]}"
         )
     start = 0
     while start < values.shape[0]:
         end = min(start + batch_size, values.shape[0])
-        if 0 < values.shape[0] - end < COMPONENTS_PER_ARM:
+        if 0 < values.shape[0] - end < components_per_arm:
             end = values.shape[0]
         yield group_tactile_embeddings(np.asarray(values[start:end], dtype=np.float32))
         start = end
@@ -58,8 +64,12 @@ def iter_batches(path: Path, batch_size: int):
 
 def main() -> None:
     args = parse_args()
-    if args.batch_size < COMPONENTS_PER_ARM:
-        raise ValueError(f"batch-size must be at least {COMPONENTS_PER_ARM}")
+    if args.components_per_arm < 1:
+        raise ValueError("components-per-arm must be positive")
+    if args.components_per_arm > 1024:
+        raise ValueError("components-per-arm cannot exceed the 1024D arm input")
+    if args.batch_size < args.components_per_arm:
+        raise ValueError(f"batch-size must be at least {args.components_per_arm}")
 
     cache_paths = {
         dataset: args.tactile_cache_root / "KaiyueChen" / dataset / "embeddings.npy"
@@ -71,7 +81,7 @@ def main() -> None:
     )
 
     models = [
-        IncrementalPCA(n_components=COMPONENTS_PER_ARM, batch_size=args.batch_size)
+        IncrementalPCA(n_components=args.components_per_arm, batch_size=args.batch_size)
         for _ in range(ARM_COUNT)
     ]
     sample_count = 0
@@ -85,7 +95,9 @@ def main() -> None:
         for dataset in args.datasets:
             dataset_count = 0
             progress.set_postfix(dataset=dataset)
-            for grouped in iter_batches(cache_paths[dataset], args.batch_size):
+            for grouped in iter_batches(
+                cache_paths[dataset], args.batch_size, args.components_per_arm
+            ):
                 for arm, model in enumerate(models):
                     model.partial_fit(grouped[:, arm, :])
                 batch_frames = grouped.shape[0]
@@ -106,7 +118,8 @@ def main() -> None:
     )
     for arm in range(ARM_COUNT):
         print(
-            f"arm {arm}: 15-component explained variance={explained[arm].sum():.6f}",
+            f"arm {arm}: {args.components_per_arm}-component "
+            f"explained variance={explained[arm].sum():.6f}",
             flush=True,
         )
     print(f"saved tactile PCA to {args.output.resolve()}", flush=True)

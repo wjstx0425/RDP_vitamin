@@ -28,13 +28,14 @@ PCA_FORMAT_VERSION = 1
 def group_tactile_embeddings(values: np.ndarray) -> np.ndarray:
     """Return ``[..., 2, 1024]`` values grouped by robot arm.
 
-    The input follows ``TACTILE_SENSOR_ORDER``. ``left_0 + left_1`` form the
-    left-arm vector and ``right_0 + right_1`` form the right-arm vector.
+    The input follows ``TACTILE_SENSOR_ORDER``. ``left_0 + right_0`` form the
+    robot-0 (left-arm) vector and ``left_1 + right_1`` form the robot-1
+    (right-arm) vector.
     """
     values = np.asarray(values)
     if values.shape[-2:] == (len(TACTILE_SENSOR_ORDER), SENSOR_EMBEDDING_DIM):
-        arm_0 = np.concatenate((values[..., 0, :], values[..., 2, :]), axis=-1)
-        arm_1 = np.concatenate((values[..., 1, :], values[..., 3, :]), axis=-1)
+        arm_0 = np.concatenate((values[..., 0, :], values[..., 1, :]), axis=-1)
+        arm_1 = np.concatenate((values[..., 2, :], values[..., 3, :]), axis=-1)
     elif values.shape[-1:] == (RAW_TACTILE_DIM,):
         reshaped = values.reshape(
             *values.shape[:-1], len(TACTILE_SENSOR_ORDER), SENSOR_EMBEDDING_DIM
@@ -49,7 +50,12 @@ def group_tactile_embeddings(values: np.ndarray) -> np.ndarray:
 
 
 class BimanualTactilePCA(nn.Module):
-    """Apply two independent 1024-to-15 PCA projections."""
+    """Apply two independent arm-wise PCA projections.
+
+    The number of components is inferred from the artifact. Existing 2x15
+    artifacts therefore remain compatible, while ablations can use 2x8,
+    2x30, or another positive component count.
+    """
 
     def __init__(self, means: np.ndarray, components: np.ndarray) -> None:
         super().__init__()
@@ -59,14 +65,27 @@ class BimanualTactilePCA(nn.Module):
             raise ValueError(
                 f"PCA means must be [{ARM_COUNT},{ARM_INPUT_DIM}], got {means.shape}"
             )
-        if components.shape != (ARM_COUNT, COMPONENTS_PER_ARM, ARM_INPUT_DIM):
+        if (
+            components.ndim != 3
+            or components.shape[0] != ARM_COUNT
+            or components.shape[1] < 1
+            or components.shape[2] != ARM_INPUT_DIM
+        ):
             raise ValueError(
                 "PCA components must be "
-                f"[{ARM_COUNT},{COMPONENTS_PER_ARM},{ARM_INPUT_DIM}], "
+                f"[{ARM_COUNT},N,{ARM_INPUT_DIM}] with N >= 1, "
                 f"got {components.shape}"
             )
         self.register_buffer("means", torch.from_numpy(means))
         self.register_buffer("components", torch.from_numpy(components))
+
+    @property
+    def components_per_arm(self) -> int:
+        return int(self.components.shape[1])
+
+    @property
+    def output_dim(self) -> int:
+        return self.components_per_arm * ARM_COUNT
 
     @classmethod
     def from_npz(
@@ -92,15 +111,15 @@ class BimanualTactilePCA(nn.Module):
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         if values.shape[-2:] == (len(TACTILE_SENSOR_ORDER), SENSOR_EMBEDDING_DIM):
-            arm_0 = torch.cat((values[..., 0, :], values[..., 2, :]), dim=-1)
-            arm_1 = torch.cat((values[..., 1, :], values[..., 3, :]), dim=-1)
+            arm_0 = torch.cat((values[..., 0, :], values[..., 1, :]), dim=-1)
+            arm_1 = torch.cat((values[..., 2, :], values[..., 3, :]), dim=-1)
             grouped = torch.stack((arm_0, arm_1), dim=-2)
         elif values.shape[-1:] == (RAW_TACTILE_DIM,):
             reshaped = values.reshape(
                 *values.shape[:-1], len(TACTILE_SENSOR_ORDER), SENSOR_EMBEDDING_DIM
             )
-            arm_0 = torch.cat((reshaped[..., 0, :], reshaped[..., 2, :]), dim=-1)
-            arm_1 = torch.cat((reshaped[..., 1, :], reshaped[..., 3, :]), dim=-1)
+            arm_0 = torch.cat((reshaped[..., 0, :], reshaped[..., 1, :]), dim=-1)
+            arm_1 = torch.cat((reshaped[..., 2, :], reshaped[..., 3, :]), dim=-1)
             grouped = torch.stack((arm_0, arm_1), dim=-2)
         else:
             raise ValueError(
@@ -125,7 +144,7 @@ class BimanualTactilePCA(nn.Module):
             components,
             optimize=True,
         )
-        return reduced.reshape(*reduced.shape[:-2], REDUCED_TACTILE_DIM)
+        return reduced.reshape(*reduced.shape[:-2], self.output_dim)
 
 
 def save_tactile_pca(

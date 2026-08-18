@@ -43,7 +43,7 @@ class FakePolicy:
         )
         torch.testing.assert_close(
             obs_dict["tactile_embedding"][0, :, 15:],
-            torch.full((2, 15), 2.0 / 255.0),
+            torch.full((2, 15), 3.0 / 255.0),
         )
         assert kwargs["return_latent_action"] is True
         self.slow_observation_states.append(

@@ -160,11 +160,12 @@ import zarr
 
 path = Path(sys.argv[1]) / "replay_buffer.zarr"
 root = zarr.open_group(str(path), mode="r")
+tactile_embedding_dim = int(root["data"]["tactile_embedding"].shape[1])
 expected = {
     "camera1": (224, 224, 3),
     "camera2": (224, 224, 3),
     "observation_state": (20,),
-    "tactile_embedding": (30,),
+    "tactile_embedding": (tactile_embedding_dim,),
     "action": (20,),
 }
 for key, tail in expected.items():

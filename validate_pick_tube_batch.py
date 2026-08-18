@@ -5,15 +5,16 @@ from __future__ import annotations
 
 import argparse
 
+import zarr
 from torch.utils.data import DataLoader
 
 from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
 
 
-def shape_meta(include_rgb: bool) -> dict:
+def shape_meta(include_rgb: bool, tactile_embedding_dim: int = 30) -> dict:
     obs = {
         "observation_state": {"shape": [20], "type": "low_dim"},
-        "tactile_embedding": {"shape": [30], "type": "low_dim"},
+        "tactile_embedding": {"shape": [tactile_embedding_dim], "type": "low_dim"},
     }
     if include_rgb:
         obs = {
@@ -23,7 +24,9 @@ def shape_meta(include_rgb: bool) -> dict:
         }
     return {
         "obs": obs,
-        "extended_obs": {"tactile_embedding": {"shape": [30], "type": "low_dim"}},
+        "extended_obs": {
+            "tactile_embedding": {"shape": [tactile_embedding_dim], "type": "low_dim"}
+        },
         "action": {"shape": [20]},
     }
 
@@ -35,8 +38,18 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     args = parser.parse_args()
 
+    replay_buffer = zarr.open_group(
+        f"{args.dataset_path}/replay_buffer.zarr", mode="r"
+    )
+    tactile_embedding_dim = int(
+        replay_buffer["data"]["tactile_embedding"].shape[1]
+    )
+
     dataset = RealImageTactileDataset(
-        shape_meta=shape_meta(include_rgb=args.mode == "ldp"),
+        shape_meta=shape_meta(
+            include_rgb=args.mode == "ldp",
+            tactile_embedding_dim=tactile_embedding_dim,
+        ),
         dataset_path=args.dataset_path,
         horizon=32,
         pad_before=3,

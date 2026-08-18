@@ -16,10 +16,7 @@ from numcodecs import Blosc
 from PIL import Image
 from tqdm.auto import tqdm
 
-from reactive_diffusion_policy.model.tactile_pca import (
-    BimanualTactilePCA,
-    REDUCED_TACTILE_DIM,
-)
+from reactive_diffusion_policy.model.tactile_pca import BimanualTactilePCA
 
 
 DEFAULT_DATASETS = (
@@ -133,7 +130,9 @@ def append(array: zarr.Array, values: np.ndarray) -> None:
     array[old_length:] = values
 
 
-def create_output(path: Path) -> tuple[zarr.Group, dict[str, zarr.Array]]:
+def create_output(
+    path: Path, tactile_embedding_dim: int
+) -> tuple[zarr.Group, dict[str, zarr.Array]]:
     root = zarr.open_group(str(path), mode="w")
     data = root.create_group("data")
     root.create_group("meta")
@@ -150,8 +149,8 @@ def create_output(path: Path) -> tuple[zarr.Group, dict[str, zarr.Array]]:
         ),
         "tactile_embedding": data.create_dataset(
             "tactile_embedding",
-            shape=(0, REDUCED_TACTILE_DIM),
-            chunks=(2048, REDUCED_TACTILE_DIM),
+            shape=(0, tactile_embedding_dim),
+            chunks=(2048, tactile_embedding_dim),
             dtype="f4",
             compressor=compressor,
         ),
@@ -167,6 +166,7 @@ def main() -> None:
     dataset_repeats = parse_dataset_repeats(args.dataset_repeats)
     zarr_path = args.output_dir / "replay_buffer.zarr"
     tactile_pca = BimanualTactilePCA.from_npz(args.tactile_pca_path)
+    tactile_embedding_dim = tactile_pca.output_dim
     if zarr_path.exists():
         if not args.overwrite:
             raise FileExistsError(f"{zarr_path} already exists; pass --overwrite to replace it")
@@ -179,7 +179,7 @@ def main() -> None:
         selected = records[: args.max_episodes_per_dataset]
         conversion_frame_count += sum(int(record["length"]) for record in selected)
 
-    root, arrays = create_output(zarr_path)
+    root, arrays = create_output(zarr_path, tactile_embedding_dim)
     episode_ends: list[int] = []
     episode_repeats: list[int] = []
     episode_dataset_ids: list[int] = []
@@ -187,7 +187,7 @@ def main() -> None:
 
     progress = tqdm(
         total=conversion_frame_count,
-        desc="Converting to PCA30 Zarr",
+        desc=f"Converting to PCA{tactile_embedding_dim} Zarr",
         unit="frame",
         unit_scale=True,
         dynamic_ncols=True,
@@ -226,7 +226,7 @@ def main() -> None:
                 raise ValueError(f"{dataset_name} episode {episode_index}: RGB shape mismatch")
             if state.shape != (expected_length, 20) or action.shape != (expected_length, 20):
                 raise ValueError(f"{dataset_name} episode {episode_index}: state/action must be [T,20]")
-            if tactile.shape != (expected_length, REDUCED_TACTILE_DIM):
+            if tactile.shape != (expected_length, tactile_embedding_dim):
                 raise ValueError(f"{dataset_name} episode {episode_index}: tactile shape mismatch")
 
             for key, values in (
@@ -265,7 +265,7 @@ def main() -> None:
     )
     root["meta"].attrs["dataset_names"] = list(args.datasets)
     root["meta"].attrs["tactile_pca_path"] = str(args.tactile_pca_path.resolve())
-    root["meta"].attrs["tactile_embedding_dim"] = REDUCED_TACTILE_DIM
+    root["meta"].attrs["tactile_embedding_dim"] = tactile_embedding_dim
     starts = [0, *episode_ends[:-1]]
     effective_frames = sum(
         (end - start) * repeat

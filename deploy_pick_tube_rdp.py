@@ -20,10 +20,7 @@ from omegaconf import OmegaConf
 
 from reactive_diffusion_policy.deploy.bridge_client import RobotBridgeClient
 from reactive_diffusion_policy.deploy.tactile_encoder_torch import load_tactile_resnet18
-from reactive_diffusion_policy.model.tactile_pca import (
-    BimanualTactilePCA,
-    REDUCED_TACTILE_DIM,
-)
+from reactive_diffusion_policy.model.tactile_pca import BimanualTactilePCA
 
 
 CAMERA_KEYS = ("observation.images.camera0", "observation.images.camera1")
@@ -63,6 +60,7 @@ def load_policy(
     at_checkpoint: Path,
     device: torch.device,
     num_inference_steps: int,
+    tactile_embedding_dim: int,
 ):
     with ldp_checkpoint.open("rb") as file:
         payload = torch.load(
@@ -74,11 +72,11 @@ def load_policy(
     cfg = copy.deepcopy(payload["cfg"])
     OmegaConf.set_struct(cfg, False)
     checkpoint_tactile_dim = int(cfg.shape_meta.obs.tactile_embedding.shape[0])
-    if checkpoint_tactile_dim != REDUCED_TACTILE_DIM:
+    if checkpoint_tactile_dim != tactile_embedding_dim:
         raise ValueError(
             f"LDP checkpoint expects {checkpoint_tactile_dim}D tactile embeddings; "
-            f"the PCA deployment requires {REDUCED_TACTILE_DIM}D. "
-            "Retrain AT and LDP with the PCA30 task configs."
+            f"the selected PCA produces {tactile_embedding_dim}D. "
+            "Use matching PCA, AT, and LDP artifacts."
         )
     cfg.at_load_dir = str(at_checkpoint)
     cfg.policy.at.load_dir = str(at_checkpoint)
@@ -163,8 +161,11 @@ class PickTubeRDPRuntime:
                 f"Expected four 512D tactile embeddings, got {raw_tactile_embedding.shape}"
             )
         tactile_embedding = self.tactile_pca(raw_tactile_embedding).reshape(1, 1, -1)
-        if tactile_embedding.shape[-1] != REDUCED_TACTILE_DIM:
-            raise RuntimeError(f"Expected 30D tactile embedding, got {tactile_embedding.shape}")
+        if tactile_embedding.shape[-1] != self.tactile_pca.output_dim:
+            raise RuntimeError(
+                f"Expected {self.tactile_pca.output_dim}D tactile embedding, "
+                f"got {tactile_embedding.shape}"
+            )
 
         obs_dict = {
             "camera1": camera_tensor[0].reshape(1, 1, 3, IMAGE_SIZE, IMAGE_SIZE),
@@ -269,14 +270,15 @@ def run(config_path: Path, device_override: str | None = None) -> None:
         raise FileNotFoundError(f"Missing RDP deployment files:\n{paths}")
     print(f"[rdp] Loading LDP: {ldp_checkpoint}")
     print(f"[rdp] Loading AT: {at_checkpoint}")
+    tactile_pca = BimanualTactilePCA.from_npz(tactile_pca_path, device=device)
     policy, checkpoint_cfg = load_policy(
         ldp_checkpoint,
         at_checkpoint,
         device,
         int(model_config.get("num_inference_steps", 8)),
+        tactile_pca.output_dim,
     )
     tactile_encoder = load_tactile_resnet18(encoder_dir, device=device)
-    tactile_pca = BimanualTactilePCA.from_npz(tactile_pca_path, device=device)
     rdp = PickTubeRDPRuntime(
         policy,
         tactile_encoder,
