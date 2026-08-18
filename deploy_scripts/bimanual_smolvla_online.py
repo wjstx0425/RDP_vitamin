@@ -59,6 +59,22 @@ SMOLVLA_OBSERVATION_RESOLUTION = SERVER_CONFIG.observation_resolution
 RDP_OBSERVATION_RESOLUTION = SERVER_CONFIG.rdp_observation_resolution
 
 
+def wait_for_cycle_deadline(
+    cycle_started_at: float,
+    cycle_duration: float,
+    *,
+    monotonic=time.monotonic,
+    wait=precise_wait,
+) -> tuple[float, bool]:
+    deadline = cycle_started_at + cycle_duration
+    elapsed = monotonic() - cycle_started_at
+    overrun = elapsed > cycle_duration
+    if not overrun:
+        wait(deadline, time_func=monotonic)
+        elapsed = monotonic() - cycle_started_at
+    return elapsed, overrun
+
+
 class ActionChunkResult(NamedTuple):
     validated: np.ndarray
     action_timestamps: np.ndarray
@@ -1396,19 +1412,18 @@ def main(
                     # renew debug info without downsampling or truncation
                     append_debug_info(env, debug_info)
 
-                    loop_length_curr = time.monotonic() - t_cycle_actual_start
-
                     if exec_mode == "block":
                         loop_length_set += latency + 0.01
                         # condifer latency and HACK in loop
 
-                    if loop_length_curr > loop_length_set:
+                    loop_length_curr, loop_overrun = wait_for_cycle_deadline(
+                        t_cycle_actual_start,
+                        loop_length_set,
+                    )
+                    if loop_overrun:
                         print("[main] loop out of time")
-                    while loop_length_curr <= loop_length_set:
-                        loop_length_curr = time.monotonic() - t_cycle_actual_start
-                        time.sleep(0.01)
 
-                    print("[main] actual loop time:", time.monotonic() - t_cycle_actual_start)
+                    print("[main] actual loop time:", loop_length_curr)
                     print()
 
                     iter_idx += steps_per_inference

@@ -47,8 +47,8 @@ class SmolVLAServerConfig:
     # Camera and observation preprocessing.
     camera: CameraConfig = CameraConfig(
         devices=(
-            CameraDeviceConfig(name="left_hand", path="/dev/video8"),
-            CameraDeviceConfig(name="right_hand", path="/dev/video6"),
+            CameraDeviceConfig(name="left_hand", path="/dev/video6"),
+            CameraDeviceConfig(name="right_hand", path="/dev/video8"),
         ),
         pixel_format="MJPG",
         width=3840,
