@@ -131,11 +131,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         )
 
         # resume training
+        resumed = False
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                self.advance_training_state_for_resume()
+                resumed = True
+                accelerator.print(
+                    f"Continuing at epoch {self.epoch}, "
+                    f"global step {self.global_step}"
+                )
 
         # configure dataset
         dataset: BaseImageDataset
@@ -185,6 +192,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
+            if resumed:
+                # Continue EMA warmup from the restored training position.
+                # Otherwise the first update overwrites the restored EMA.
+                ema.optimization_step = self.global_step
 
         # configure logging
         # wandb_run = wandb.init(
@@ -226,11 +237,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
 
+        num_epochs_to_run = self.get_remaining_epochs(cfg.training.num_epochs)
+        if resumed:
+            accelerator.print(
+                f"Remaining epochs: {num_epochs_to_run} "
+                f"(target total: {cfg.training.num_epochs})"
+            )
+
         # training loop
         log_name = 'logs.json.txt' if accelerator.is_main_process else f'logs.rank{accelerator.process_index}.json.txt'
         log_path = os.path.join(self.output_dir, log_name)
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            for local_epoch_idx in range(num_epochs_to_run):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
@@ -289,7 +307,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 step_log['train_loss'] = train_loss
 
                 # ========= eval for this epoch ==========
-                policy = accelerator.unwrap_model(self.model)
+                train_policy = accelerator.unwrap_model(self.model)
+                policy = train_policy
                 if cfg.training.use_ema:
                     policy = self.ema_model
                 policy.eval()
@@ -302,13 +321,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model(batch)
-                                val_losses.append(loss)
+                                # Validate the same policy used for sampling and
+                                # deployment. In particular, when EMA is enabled,
+                                # using self.model here evaluates the non-EMA model
+                                # in train mode and keeps stochastic image
+                                # augmentation active.
+                                loss = policy(batch)
+                                val_losses.append(loss.detach())
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
                         if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
+                            val_loss = torch.stack(val_losses).mean().item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
 
@@ -343,7 +367,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 accelerator.wait_for_everyone()
                 
                 # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
+                if self.should_save_checkpoint(
+                    cfg.training.checkpoint_every,
+                    local_epoch_idx,
+                    num_epochs_to_run,
+                ) and accelerator.is_main_process:
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
@@ -372,7 +400,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     self.model = model_ddp
                     
                 # ========= eval end for this epoch ==========
-                policy.train()
+                train_policy.train()
+                if self.ema_model is not None:
+                    # EMA is an inference/evaluation copy and should never be
+                    # left in train mode between validation passes.
+                    self.ema_model.eval()
 
                 # end of epoch
                 # log of last step is combined with validation and rollout

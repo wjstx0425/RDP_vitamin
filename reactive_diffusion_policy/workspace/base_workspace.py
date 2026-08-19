@@ -17,6 +17,37 @@ class BaseWorkspace:
         self._output_dir = output_dir
         self._saving_thread = None
 
+    def advance_training_state_for_resume(self):
+        """Advance counters stored by end-of-epoch checkpoints.
+
+        Training checkpoints are saved after the last optimizer step of an
+        epoch, but before global_step and epoch are incremented. A resumed run
+        must therefore start at the following step and epoch.
+        """
+        self.global_step = int(self.global_step) + 1
+        self.epoch = int(self.epoch) + 1
+
+    def get_remaining_epochs(self, target_num_epochs):
+        """Return epochs left when target_num_epochs is a total target."""
+        target_num_epochs = int(target_num_epochs)
+        if target_num_epochs < 0:
+            raise ValueError("target_num_epochs must be non-negative")
+        return max(0, target_num_epochs - int(self.epoch))
+
+    def should_save_checkpoint(self, checkpoint_every, local_epoch_idx, num_epochs_to_run):
+        """Save on the configured cadence and after the final requested epoch."""
+        checkpoint_every = int(checkpoint_every)
+        local_epoch_idx = int(local_epoch_idx)
+        num_epochs_to_run = int(num_epochs_to_run)
+        if checkpoint_every < 1:
+            raise ValueError("checkpoint_every must be positive")
+        if num_epochs_to_run < 1 or not 0 <= local_epoch_idx < num_epochs_to_run:
+            raise ValueError("local_epoch_idx must identify an epoch in this run")
+        return (
+            int(self.epoch) % checkpoint_every == 0
+            or local_epoch_idx == num_epochs_to_run - 1
+        )
+
     @property
     def output_dir(self):
         output_dir = self._output_dir

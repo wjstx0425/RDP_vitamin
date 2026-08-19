@@ -4,17 +4,7 @@ defaults:
   - override /at: at_pick_tube
   - _self_
 
-n_action_steps: 10
-dataset_obs_steps: 1
-dataset_obs_temporal_downsample_ratio: 1
-
-dataloader:
-  batch_size: 64
-  num_workers: 4
-
-val_dataloader:
-  batch_size: 64
-  num_workers: 4
-
+# Keep the official method/model settings, but shorten training for this much
+# larger dataset.
 training:
-  mixed_precision: bf16
+  num_epochs: 20

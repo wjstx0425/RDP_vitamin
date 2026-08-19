@@ -8,6 +8,53 @@ from reactive_diffusion_policy.model.common.module_attr_mixin import ModuleAttrM
 from reactive_diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
+class TrainOnlyTransform(nn.Module):
+    """Apply stochastic image augmentation only while the encoder is training."""
+
+    def __init__(self, transform: nn.Module):
+        super().__init__()
+        self.transform = transform
+
+    def forward(self, value):
+        if not self.training:
+            return value
+        return self.transform(value)
+
+
+def build_random_transforms(specs, input_shape):
+    if specs is None:
+        return nn.Identity()
+
+    transforms = []
+    for spec in specs:
+        if isinstance(spec, nn.Module):
+            transforms.append(copy.deepcopy(spec))
+            continue
+
+        transform_type = spec.type
+        if transform_type == 'RandomCrop':
+            ratio = float(spec.ratio)
+            if not 0 < ratio <= 1:
+                raise ValueError(f"RandomCrop ratio must be in (0, 1], got {ratio}")
+            transforms.append(CropRandomizer(
+                input_shape=input_shape,
+                crop_height=int(input_shape[1] * ratio),
+                crop_width=int(input_shape[2] * ratio),
+                num_crops=1,
+                pos_enc=False,
+            ))
+        elif transform_type == 'ColorJitter':
+            transforms.append(TrainOnlyTransform(torchvision.transforms.ColorJitter(
+                brightness=float(spec.get('brightness', 0.0)),
+                contrast=float(spec.get('contrast', 0.0)),
+                saturation=float(spec.get('saturation', 0.0)),
+                hue=float(spec.get('hue', 0.0)),
+            )))
+        else:
+            raise ValueError(f"Unsupported random transform: {transform_type}")
+    return nn.Sequential(*transforms)
+
+
 class MultiImageObsEncoder(ModuleAttrMixin):
     def __init__(self,
             shape_meta: dict,
@@ -100,20 +147,7 @@ class MultiImageObsEncoder(ModuleAttrMixin):
                 #         this_normalizer = torchvision.transforms.CenterCrop(
                 #             size=(h,w)
                 #         )
-                assert len(random_transforms) == 1, "Only support single RandomCrop now"
-                if random_transforms is not None and not isinstance(random_transforms[0], torch.nn.Module):
-                    assert random_transforms[0].type == 'RandomCrop'
-                    ratio = random_transforms[0].ratio
-                    random_transforms = [
-                                     CropRandomizer(
-                                            input_shape=input_shape,
-                                            crop_height=int(input_shape[1]*ratio),
-                                            crop_width=int(input_shape[2]*ratio),
-                                            num_crops=1,
-                                            pos_enc=False
-                                     )
-                                 ] + random_transforms[1:]
-                this_randomizer = nn.Identity() if random_transforms is None else torch.nn.Sequential(*random_transforms)
+                this_randomizer = build_random_transforms(random_transforms, input_shape)
                 # configure normalizer
                 this_normalizer = nn.Identity()
                 if imagenet_norm:

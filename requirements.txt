@@ -1,6 +1,7 @@
 numpy==1.26.4
 numba
 scipy
+scikit-learn
 opencv-python
 cffi
 ipykernel

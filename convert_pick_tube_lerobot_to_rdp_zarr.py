@@ -14,9 +14,20 @@ import pyarrow.parquet as pq
 import zarr
 from numcodecs import Blosc
 from PIL import Image
+from tqdm.auto import tqdm
+
+from reactive_diffusion_policy.model.tactile_pca import BimanualTactilePCA
 
 
-DEFAULT_DATASETS = ("pick_tube_01", "pick_tube_02", "pick_tube_03", "pick_tube_04")
+DEFAULT_DATASETS = (
+    "pick_tube_01",
+    "pick_tube_02",
+    "pick_tube_03",
+    "pick_tube_04",
+    "pick_tube_05",
+    "pick_tube_06",
+)
+DEFAULT_DATASET_REPEATS = ("pick_tube_05=2", "pick_tube_06=2")
 CAMERA_KEYS = ("observation.images.camera0", "observation.images.camera1")
 STATE_KEY = "observation.state"
 ACTION_KEY = "actions"
@@ -40,10 +51,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/pick_tube_01_04_rdp_zarr"),
+        default=Path("data/pick_tube_01_06_pca30_rdp_zarr"),
         help="Parent directory for replay_buffer.zarr",
     )
+    parser.add_argument(
+        "--tactile-pca-path",
+        type=Path,
+        default=Path("data/PCA_Transform_PickTube/tactile_pca_2x15.npz"),
+        help="Two-arm PCA artifact produced by fit_pick_tube_tactile_pca.py",
+    )
     parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
+    parser.add_argument(
+        "--dataset-repeats",
+        nargs="*",
+        default=list(DEFAULT_DATASET_REPEATS),
+        metavar="DATASET=REPEAT",
+        help="Training-only episode repeat factors stored as Zarr metadata.",
+    )
     parser.add_argument(
         "--max-episodes-per-dataset",
         type=int,
@@ -52,6 +76,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def parse_dataset_repeats(items: list[str]) -> dict[str, int]:
+    repeats: dict[str, int] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"invalid repeat specification {item!r}; expected DATASET=REPEAT")
+        dataset, value = item.rsplit("=", 1)
+        repeat = int(value)
+        if repeat < 1:
+            raise ValueError(f"repeat factor must be positive, got {item!r}")
+        repeats[dataset] = repeat
+    return repeats
 
 
 def load_episode_lengths(dataset_dir: Path) -> tuple[list[dict], dict[int, int]]:
@@ -93,7 +130,9 @@ def append(array: zarr.Array, values: np.ndarray) -> None:
     array[old_length:] = values
 
 
-def create_output(path: Path) -> tuple[zarr.Group, dict[str, zarr.Array]]:
+def create_output(
+    path: Path, tactile_embedding_dim: int
+) -> tuple[zarr.Group, dict[str, zarr.Array]]:
     root = zarr.open_group(str(path), mode="w")
     data = root.create_group("data")
     root.create_group("meta")
@@ -109,7 +148,11 @@ def create_output(path: Path) -> tuple[zarr.Group, dict[str, zarr.Array]]:
             "observation_state", shape=(0, 20), chunks=(2048, 20), dtype="f4", compressor=compressor
         ),
         "tactile_embedding": data.create_dataset(
-            "tactile_embedding", shape=(0, 2048), chunks=(256, 2048), dtype="f2", compressor=compressor
+            "tactile_embedding",
+            shape=(0, tactile_embedding_dim),
+            chunks=(2048, tactile_embedding_dim),
+            dtype="f4",
+            compressor=compressor,
         ),
         "action": data.create_dataset(
             "action", shape=(0, 20), chunks=(2048, 20), dtype="f4", compressor=compressor
@@ -120,18 +163,37 @@ def create_output(path: Path) -> tuple[zarr.Group, dict[str, zarr.Array]]:
 
 def main() -> None:
     args = parse_args()
+    dataset_repeats = parse_dataset_repeats(args.dataset_repeats)
     zarr_path = args.output_dir / "replay_buffer.zarr"
+    tactile_pca = BimanualTactilePCA.from_npz(args.tactile_pca_path)
+    tactile_embedding_dim = tactile_pca.output_dim
     if zarr_path.exists():
         if not args.overwrite:
             raise FileExistsError(f"{zarr_path} already exists; pass --overwrite to replace it")
         shutil.rmtree(zarr_path)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    root, arrays = create_output(zarr_path)
+    conversion_frame_count = 0
+    for dataset_name in args.datasets:
+        records, _ = load_episode_lengths(args.dataset_root / dataset_name)
+        selected = records[: args.max_episodes_per_dataset]
+        conversion_frame_count += sum(int(record["length"]) for record in selected)
+
+    root, arrays = create_output(zarr_path, tactile_embedding_dim)
     episode_ends: list[int] = []
+    episode_repeats: list[int] = []
+    episode_dataset_ids: list[int] = []
     total_frames = 0
 
-    for dataset_name in args.datasets:
+    progress = tqdm(
+        total=conversion_frame_count,
+        desc=f"Converting to PCA{tactile_embedding_dim} Zarr",
+        unit="frame",
+        unit_scale=True,
+        dynamic_ncols=True,
+    )
+
+    for dataset_id, dataset_name in enumerate(args.datasets):
         dataset_dir = args.dataset_root / dataset_name
         records, offsets = load_episode_lengths(dataset_dir)
         cache_path = args.tactile_cache_root / "KaiyueChen" / dataset_name / "embeddings.npy"
@@ -143,6 +205,7 @@ def main() -> None:
         for record in selected:
             episode_index = int(record["episode_index"])
             expected_length = int(record["length"])
+            progress.set_postfix(dataset=dataset_name, episode=episode_index)
             table = pq.read_table(parquet_path(dataset_dir, episode_index), columns=list(PARQUET_KEYS))
             if table.num_rows != expected_length:
                 raise ValueError(
@@ -154,13 +217,16 @@ def main() -> None:
             state = np.asarray(table[STATE_KEY].to_pylist(), dtype=np.float32)
             action = np.asarray(table[ACTION_KEY].to_pylist(), dtype=np.float32)
             start = offsets[episode_index]
-            tactile = np.asarray(tactile_cache[start : start + expected_length], dtype=np.float16).reshape(expected_length, 2048)
+            tactile_raw = np.asarray(
+                tactile_cache[start : start + expected_length], dtype=np.float32
+            )
+            tactile = tactile_pca.transform_numpy(tactile_raw)
 
             if camera1.shape != (expected_length, 224, 224, 3) or camera2.shape != camera1.shape:
                 raise ValueError(f"{dataset_name} episode {episode_index}: RGB shape mismatch")
             if state.shape != (expected_length, 20) or action.shape != (expected_length, 20):
                 raise ValueError(f"{dataset_name} episode {episode_index}: state/action must be [T,20]")
-            if tactile.shape != (expected_length, 2048):
+            if tactile.shape != (expected_length, tactile_embedding_dim):
                 raise ValueError(f"{dataset_name} episode {episode_index}: tactile shape mismatch")
 
             for key, values in (
@@ -173,7 +239,11 @@ def main() -> None:
                 append(arrays[key], values)
             total_frames += expected_length
             episode_ends.append(total_frames)
-            print(f"{dataset_name} episode {episode_index}: {expected_length} frames -> total {total_frames}", flush=True)
+            episode_repeats.append(dataset_repeats.get(dataset_name, 1))
+            episode_dataset_ids.append(dataset_id)
+            progress.update(expected_length)
+
+    progress.close()
 
     root["meta"].create_dataset(
         "episode_ends",
@@ -181,7 +251,30 @@ def main() -> None:
         chunks=(max(1, min(1024, len(episode_ends))),),
         compressor=None,
     )
-    print(f"wrote {len(episode_ends)} episodes / {total_frames} frames to {zarr_path}")
+    root["meta"].create_dataset(
+        "episode_repeats",
+        data=np.asarray(episode_repeats, dtype=np.int16),
+        chunks=(max(1, min(1024, len(episode_repeats))),),
+        compressor=None,
+    )
+    root["meta"].create_dataset(
+        "episode_dataset_ids",
+        data=np.asarray(episode_dataset_ids, dtype=np.int16),
+        chunks=(max(1, min(1024, len(episode_dataset_ids))),),
+        compressor=None,
+    )
+    root["meta"].attrs["dataset_names"] = list(args.datasets)
+    root["meta"].attrs["tactile_pca_path"] = str(args.tactile_pca_path.resolve())
+    root["meta"].attrs["tactile_embedding_dim"] = tactile_embedding_dim
+    starts = [0, *episode_ends[:-1]]
+    effective_frames = sum(
+        (end - start) * repeat
+        for start, end, repeat in zip(starts, episode_ends, episode_repeats)
+    )
+    print(
+        f"wrote {len(episode_ends)} episodes / {total_frames} physical frames / "
+        f"{effective_frames} effective training frames to {zarr_path}"
+    )
 
 
 if __name__ == "__main__":

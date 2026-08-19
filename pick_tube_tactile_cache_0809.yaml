@@ -7,6 +7,10 @@ datasets:
     root: /home/hillbot/datasets/pick_tube_03
   - repo_id: KaiyueChen/pick_tube_04
     root: /home/hillbot/datasets/pick_tube_04
+  - repo_id: KaiyueChen/pick_tube_05
+    root: /home/hillbot/datasets/pick_tube_05
+  - repo_id: KaiyueChen/pick_tube_06
+    root: /home/hillbot/datasets/pick_tube_06
 
 tactile_embedding_cache:
   root: /home/hillbot/FRS_Tact/reactive_diffusion_policy-main/data/tactile_embeddings_encoder0809
