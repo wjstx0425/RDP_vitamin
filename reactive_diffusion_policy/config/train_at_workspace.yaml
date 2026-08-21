@@ -91,12 +91,17 @@ logging:
   id: null
   group: null
 
+validation:
+  active_left_baseline: null
+  max_active_degradation: 0.05
+  min_micro_motion_recall: 0.95
+
 checkpoint:
   topk:
-    monitor_key: train_loss
+    monitor_key: val_idle_score
     mode: min
     k: 20
-    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.6f}.ckpt'
+    format_str: 'epoch={epoch:04d}-val_idle_score={val_idle_score:.6f}.ckpt'
   save_last_ckpt: True
   save_last_snapshot: False
 

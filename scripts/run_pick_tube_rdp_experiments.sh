@@ -32,7 +32,7 @@ LEROBOT_ROOT=${LEROBOT_ROOT:-/home/hillbot/datasets}
 TACTILE_CACHE_ROOT=${TACTILE_CACHE_ROOT:-${RDP_DIR}/data/tactile_embeddings_encoder0809}
 PCA_ROOT=${PCA_ROOT:-${RDP_DIR}/data/PCA_Transform_PickTube}
 DATA_ROOT=${DATA_ROOT:-${RDP_DIR}/data}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${DATA_ROOT}/outputs/pick_tube_${DATASET_TAG}}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${DATA_ROOT}/outputs/pick_tube_${DATASET_TAG}_v2}
 
 CURRENT_DATASET_PATH=${CURRENT_DATASET_PATH:-${RDP_DIR}/data/pick_tube_02_04_06_pca30_armwise_rdp_zarr}
 CURRENT_OUTPUT_ROOT=${CURRENT_OUTPUT_ROOT:-${RDP_DIR}/data/outputs/pick_tube_02_04_06}
@@ -122,7 +122,7 @@ dataset_path() {
     printf '%s' "${override_value}"
     return
   fi
-  printf '%s/pick_tube_%s_pca%d_armwise_rdp_zarr' \
+  printf '%s/pick_tube_%s_pca%d_armwise_rdp_zarr_v2' \
     "${DATA_ROOT}" "${DATASET_TAG}" "${tactile_dim}"
 }
 
@@ -219,14 +219,14 @@ train_six_dimension() {
     "LOGGING_MODE=${LOGGING_MODE}" \
     "MIXED_PRECISION=${MIXED_PRECISION}" \
     "TACTILE_DIM=${tactile_dim}" \
-    "AT_EPOCHS=15" \
-    "LDP_EPOCHS=15" \
+    "AT_EPOCHS=20" \
+    "LDP_EPOCHS=20" \
     "AT_BATCH=${AT_BATCH}" \
     "LDP_BATCH=${LDP_BATCH}" \
     "NUM_WORKERS=${NUM_WORKERS}" \
     "AT_CHECKPOINT_EVERY=2" \
     "LDP_CHECKPOINT_EVERY=2" \
-    "RESUME=true" \
+    "RESUME=false" \
     "VALIDATE_DATASET=0" \
     "DRY_RUN=${DRY_RUN}" \
     bash scripts/train_pick_tube_single_gpu.sh all

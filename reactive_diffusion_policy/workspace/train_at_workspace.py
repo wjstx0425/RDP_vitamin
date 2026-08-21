@@ -32,6 +32,12 @@ from reactive_diffusion_policy.common.artifact_manifest import (
     load_normalizer_cache,
     save_normalizer_cache,
 )
+from reactive_diffusion_policy.common.pick_tube_validation import (
+    compute_idle_rollout_metrics,
+    evaluate_checkpoint_feasibility,
+    reconstruct_at_actions,
+    validate_resume_action_contract,
+)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -125,6 +131,7 @@ class TrainATWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 payload = self.load_checkpoint(path=lastest_ckpt_path)
+                validate_resume_action_contract(cfg, payload.get("cfg"))
                 resumed_optimizer_step = "optimizer_step" in payload.get("pickles", {})
                 self.advance_training_state_for_resume()
                 resumed = True
@@ -137,6 +144,13 @@ class TrainATWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
+        OmegaConf.update(
+            self.cfg,
+            "validation_split",
+            dataset.split_manifest,
+            merge=False,
+            force_add=True,
+        )
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer_path = pathlib.Path(self.output_dir) / "normalizer.pkl"
         normalizer_signature = build_normalizer_cache_signature(cfg, dataset, None)
@@ -324,14 +338,31 @@ class TrainATWorkspace(BaseWorkspace):
                         val_kl_loss = list()
                         val_encoder_loss = list()
                         val_vae_recon_loss = list()
+                        val_targets = list()
+                        val_predictions = list()
+                        val_idle_masks = list()
+                        val_valid_masks = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                                        leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
                                     loss_metric_dict = self.model.compute_loss_and_metric(batch)
+                                    physical_prediction = reconstruct_at_actions(
+                                        policy, batch
+                                    )
                                 loss = loss_metric_dict["loss"]
                                 val_losses.append(loss)
+                                val_targets.append(batch["action"].detach().cpu())
+                                val_predictions.append(
+                                    physical_prediction.detach().cpu()
+                                )
+                                val_idle_masks.append(
+                                    batch["idle_arm_mask"].detach().cpu()
+                                )
+                                val_valid_masks.append(
+                                    batch["valid_mask"].detach().cpu()
+                                )
                                 # metric
                                 val_encoder_loss.append(loss_metric_dict["encoder_loss"])
                                 val_vae_recon_loss.append(loss_metric_dict["vae_recon_loss"])
@@ -360,6 +391,39 @@ class TrainATWorkspace(BaseWorkspace):
                                 step_log['val_vq_loss_state'] = np.mean(val_vq_loss_state)
                             if len(val_kl_loss) > 0:
                                 step_log['val_kl_loss'] = np.mean(val_kl_loss)
+                            physical_metrics = compute_idle_rollout_metrics(
+                                torch.cat(val_targets),
+                                torch.cat(val_predictions),
+                                torch.cat(val_idle_masks),
+                                horizon=cfg.n_action_steps,
+                                valid_mask=torch.cat(val_valid_masks),
+                            )
+                            step_log.update(physical_metrics)
+                            active_metric = (
+                                physical_metrics[
+                                    "val_active_left_translation_mae_mm"
+                                ]
+                                + physical_metrics[
+                                    "val_active_left_rotation_mae_deg"
+                                ]
+                            )
+                            step_log.update(
+                                evaluate_checkpoint_feasibility(
+                                    idle_translation_29_mm=physical_metrics[
+                                        "val_idle_translation_29_mm"
+                                    ],
+                                    idle_rotation_29_deg=physical_metrics[
+                                        "val_idle_rotation_29_deg"
+                                    ],
+                                    active_metric=active_metric,
+                                    active_baseline=cfg.validation.active_left_baseline,
+                                    micro_motion_recall=physical_metrics[
+                                        "val_micro_motion_recall"
+                                    ],
+                                    max_active_degradation=cfg.validation.max_active_degradation,
+                                    min_micro_motion_recall=cfg.validation.min_micro_motion_recall,
+                                )
+                            )
 
                 # checkpoint
                 if self.should_save_checkpoint(
@@ -382,7 +446,9 @@ class TrainATWorkspace(BaseWorkspace):
                     # We can't copy the last checkpoint here
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    topk_ckpt_path = None
+                    if metric_dict.get("val_checkpoint_feasible", False):
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)

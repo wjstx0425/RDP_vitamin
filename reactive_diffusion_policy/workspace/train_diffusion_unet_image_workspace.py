@@ -33,6 +33,11 @@ from reactive_diffusion_policy.common.artifact_manifest import (
     load_normalizer_cache,
     save_normalizer_cache,
 )
+from reactive_diffusion_policy.common.pick_tube_validation import (
+    compute_idle_rollout_metrics,
+    evaluate_checkpoint_feasibility,
+    validate_resume_action_contract,
+)
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from reactive_diffusion_policy.workspace.train_at_workspace import (
@@ -158,6 +163,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 payload = self.load_checkpoint(path=lastest_ckpt_path)
+                validate_resume_action_contract(cfg, payload.get("cfg"))
                 resumed_optimizer_step = "optimizer_step" in payload.get("pickles", {})
                 self.advance_training_state_for_resume()
                 resumed = True
@@ -170,6 +176,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
+        OmegaConf.update(
+            self.cfg,
+            "validation_split",
+            dataset.split_manifest,
+            merge=False,
+            force_add=True,
+        )
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         if resumed and not resumed_optimizer_step:
             self.optimizer_step = get_legacy_optimizer_step(
@@ -365,6 +378,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 if cfg.task.dataset.val_ratio > 0 and (self.epoch % cfg.training.val_every) == 0 and accelerator.is_main_process:
                     with torch.no_grad():
                         val_losses = list()
+                        val_targets = list()
+                        val_predictions = list()
+                        val_idle_masks = list()
+                        val_valid_masks = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
@@ -376,6 +393,26 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 # augmentation active.
                                 loss = policy(batch)
                                 val_losses.append(loss.detach())
+                                if 'latent' in cfg.name:
+                                    result = policy.predict_action(
+                                        batch["obs"],
+                                        extended_obs_dict=batch["extended_obs"],
+                                        dataset_obs_temporal_downsample_ratio=(
+                                            cfg.task.dataset.obs_temporal_downsample_ratio
+                                        ),
+                                    )
+                                else:
+                                    result = policy.predict_action(batch["obs"])
+                                val_targets.append(batch["action"].detach().cpu())
+                                val_predictions.append(
+                                    result["action_pred"].detach().cpu()
+                                )
+                                val_idle_masks.append(
+                                    batch["idle_arm_mask"].detach().cpu()
+                                )
+                                val_valid_masks.append(
+                                    batch["valid_mask"].detach().cpu()
+                                )
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
@@ -383,6 +420,39 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             val_loss = torch.stack(val_losses).mean().item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            physical_metrics = compute_idle_rollout_metrics(
+                                torch.cat(val_targets),
+                                torch.cat(val_predictions),
+                                torch.cat(val_idle_masks),
+                                horizon=cfg.n_action_steps,
+                                valid_mask=torch.cat(val_valid_masks),
+                            )
+                            step_log.update(physical_metrics)
+                            active_metric = (
+                                physical_metrics[
+                                    "val_active_left_translation_mae_mm"
+                                ]
+                                + physical_metrics[
+                                    "val_active_left_rotation_mae_deg"
+                                ]
+                            )
+                            step_log.update(
+                                evaluate_checkpoint_feasibility(
+                                    idle_translation_29_mm=physical_metrics[
+                                        "val_idle_translation_29_mm"
+                                    ],
+                                    idle_rotation_29_deg=physical_metrics[
+                                        "val_idle_rotation_29_deg"
+                                    ],
+                                    active_metric=active_metric,
+                                    active_baseline=cfg.validation.active_left_baseline,
+                                    micro_motion_recall=physical_metrics[
+                                        "val_micro_motion_recall"
+                                    ],
+                                    max_active_degradation=cfg.validation.max_active_degradation,
+                                    min_micro_motion_recall=cfg.validation.min_micro_motion_recall,
+                                )
+                            )
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
@@ -439,7 +509,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     # We can't copy the last checkpoint here
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    topk_ckpt_path = None
+                    if metric_dict.get("val_checkpoint_feasible", False):
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)

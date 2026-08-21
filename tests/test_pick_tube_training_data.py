@@ -257,9 +257,9 @@ def test_pick_tube_configs_match_official_rdp_temporal_and_model_defaults():
         assert cfg.n_action_steps == 29
         assert cfg.task.dataset.pad_before == 3
         assert cfg.task.dataset.pad_after == 28
-        assert cfg.task.dataset.val_ratio == 0.0
+        assert cfg.task.dataset.val_ratio == 0.1
         assert cfg.task.dataset.use_episode_repeats is False
-        assert cfg.checkpoint.topk.monitor_key == "train_loss"
+        assert cfg.checkpoint.topk.monitor_key == "val_idle_score"
         assert cfg.training.val_every == 1
         assert list(cfg.task.shape_meta.obs.tactile_embedding.shape) == [30]
         assert list(cfg.task.shape_meta.extended_obs.tactile_embedding.shape) == [30]

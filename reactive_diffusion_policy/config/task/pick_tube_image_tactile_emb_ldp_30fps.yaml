@@ -2,6 +2,8 @@ name: pick_tube_image_tactile_emb_ldp_30fps
 dataset_path: data/pick_tube_01_06_pca30_rdp_zarr
 image_shape: [3, 224, 224]
 tactile_embedding_dim: 30
+action_representation_version: 2
+action_contract: bimanual_relative_pose20d_v2
 
 shape_meta: &shape_meta
   obs:
@@ -35,7 +37,7 @@ dataset:
   obs_temporal_downsample_ratio: ${dataset_obs_temporal_downsample_ratio}
   n_latency_steps: ${n_latency_steps}
   seed: 42
-  val_ratio: 0.0
+  val_ratio: 0.1
   max_train_episodes: null
   use_episode_repeats: false
   delta_action: false

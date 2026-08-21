@@ -12,7 +12,11 @@ from reactive_diffusion_policy.dataset.base_dataset import BaseImageDataset
 from reactive_diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from reactive_diffusion_policy.common.replay_buffer import ReplayBuffer
 from reactive_diffusion_policy.common.sampler import (
-    SequenceSampler, get_val_mask, downsample_mask)
+    SequenceSampler, downsample_mask)
+from reactive_diffusion_policy.common.pick_tube_validation import (
+    build_episode_split_manifest,
+)
+from reactive_diffusion_policy.common.artifact_manifest import stable_json_digest
 from reactive_diffusion_policy.common.normalize_util import (
     get_image_range_normalizer,
     get_action_normalizer
@@ -139,15 +143,35 @@ class RealImageTactileDataset(BaseImageDataset):
         self.key_first_k = key_first_k
 
         self.seed = seed
-        val_mask = get_val_mask(
-            n_episodes=replay_buffer.n_episodes, 
+        if "episode_dataset_ids" in zarr_root["meta"]:
+            episode_sources = zarr_root["meta"]["episode_dataset_ids"][:]
+        else:
+            episode_sources = np.zeros(replay_buffer.n_episodes, dtype=np.int64)
+        split_manifest = build_episode_split_manifest(
+            episode_sources,
             val_ratio=val_ratio,
-            seed=seed)
+            seed=seed,
+        )
+        val_mask = np.zeros(replay_buffer.n_episodes, dtype=bool)
+        val_mask[split_manifest["validation_episode_ids"]] = True
         train_mask = ~val_mask
         train_mask = downsample_mask(
             mask=train_mask, 
             max_n=max_train_episodes, 
             seed=seed)
+        split_identity = {
+            key: value
+            for key, value in split_manifest.items()
+            if key != "split_digest"
+        }
+        split_identity["train_episode_ids"] = np.flatnonzero(train_mask).tolist()
+        split_identity["excluded_episode_ids"] = np.flatnonzero(
+            ~(train_mask | val_mask)
+        ).tolist()
+        split_manifest = {
+            **split_identity,
+            "split_digest": stable_json_digest(split_identity),
+        }
 
         episode_repeats = None
         if use_episode_repeats:
@@ -175,6 +199,7 @@ class RealImageTactileDataset(BaseImageDataset):
         self.obs_downsample_ratio = obs_temporal_downsample_ratio
         self.val_mask = val_mask
         self.train_mask = train_mask
+        self.split_manifest = split_manifest
         self.episode_repeats = episode_repeats
         self.horizon = horizon
         self.n_latency_steps = n_latency_steps
