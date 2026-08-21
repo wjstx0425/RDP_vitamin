@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from reactive_diffusion_policy.model.tactile_pca import BimanualTactilePCA
@@ -36,14 +37,31 @@ def test_torch_projection_uses_the_same_robot_grouping() -> None:
     np.testing.assert_array_equal(projected[[0, 1, 15, 16]], [0.0, 1.0, 2.0, 3.0])
 
 
-def test_projection_dimension_is_inferred_from_components() -> None:
+@pytest.mark.parametrize("components_per_arm", [8, 15, 30])
+def test_projection_dimension_is_inferred_from_components(
+    components_per_arm: int,
+) -> None:
     means = np.zeros((2, 1024), dtype=np.float32)
-    for components_per_arm in (8, 30):
-        components = np.zeros(
-            (2, components_per_arm, 1024), dtype=np.float32
-        )
-        model = BimanualTactilePCA(means, components)
+    components = np.zeros((2, components_per_arm, 1024), dtype=np.float32)
+    model = BimanualTactilePCA(means, components)
 
-        assert model.components_per_arm == components_per_arm
-        assert model.output_dim == components_per_arm * 2
-        assert model(torch.from_numpy(sensor_values())).shape == (model.output_dim,)
+    assert model.components_per_arm == components_per_arm
+    assert model.output_dim == components_per_arm * 2
+    assert model(torch.from_numpy(sensor_values())).shape == (model.output_dim,)
+    assert model.transform_numpy(sensor_values()).shape == (model.output_dim,)
+    flat_batch = np.stack([sensor_values().reshape(-1)] * 2)
+    assert model(torch.from_numpy(flat_batch)).shape == (2, model.output_dim)
+    assert model.transform_numpy(flat_batch).shape == (2, model.output_dim)
+
+
+@pytest.mark.parametrize("field", ["means", "components"])
+def test_pca_rejects_non_finite_values(field: str) -> None:
+    means = np.zeros((2, 1024), dtype=np.float32)
+    components = np.zeros((2, 8, 1024), dtype=np.float32)
+    if field == "means":
+        means[0, 0] = np.nan
+    else:
+        components[0, 0, 0] = np.inf
+
+    with pytest.raises(ValueError, match=f"PCA {field} must contain only finite values"):
+        BimanualTactilePCA(means, components)

@@ -76,6 +76,10 @@ class BimanualTactilePCA(nn.Module):
                 f"[{ARM_COUNT},N,{ARM_INPUT_DIM}] with N >= 1, "
                 f"got {components.shape}"
             )
+        if not np.isfinite(means).all():
+            raise ValueError("PCA means must contain only finite values")
+        if not np.isfinite(components).all():
+            raise ValueError("PCA components must contain only finite values")
         self.register_buffer("means", torch.from_numpy(means))
         self.register_buffer("components", torch.from_numpy(components))
 
