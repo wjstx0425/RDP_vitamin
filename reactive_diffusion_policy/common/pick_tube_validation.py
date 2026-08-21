@@ -548,15 +548,10 @@ def _select(config, key: str):
 
 
 def load_active_metric_baselines(config) -> dict[str, float] | None:
-    """Load separate frozen-v1 active metrics required by v2 training."""
-    action_version = _select(config, "task.action_representation_version")
+    """Load optional frozen-v1 active metrics used by deployment gates."""
     baseline_path = _select(config, "validation.baseline_json")
-    if action_version != 2 and not baseline_path:
-        return None
     if not baseline_path:
-        raise ValueError(
-            "pick-tube v2 training requires validation.baseline_json before training"
-        )
+        return None
     path = Path(str(baseline_path)).expanduser()
     if not path.is_file():
         raise FileNotFoundError(f"validation baseline_json does not exist: {path}")

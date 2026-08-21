@@ -42,7 +42,7 @@ bash scripts/setup_pick_tube_data.sh convert
 
 ## 3. 单卡完整训练
 
-训练前必须提供冻结 v1 验证结果 JSON；两个值必须来自实测，不能混合单位：
+冻结 v1 验证结果 JSON 现在是可选的。提供时，两个值必须来自实测，不能混合单位：
 
 ```text
 {
@@ -51,10 +51,13 @@ bash scripts/setup_pick_tube_data.sh convert
 }
 ```
 
+如果暂时没有 baseline，可以省略 `BASELINE_JSON`。AT/LDP 会正常训练并保存
+`latest.ckpt`，但 checkpoint 会保持 `non-deployable`，并且不会进入 top-k；
+补齐实测 baseline 后再做正式模型选择。
+
 ```bash
 GPU_ID=0 \
 RUN_ID=pca30_latent32_full6_v1 \
-BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json \
 AT_EPOCHS=20 \
 LDP_EPOCHS=10 \
 AT_BATCH=64 \

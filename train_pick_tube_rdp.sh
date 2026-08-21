@@ -13,10 +13,8 @@ LDP_OUTPUT_DIR=${LDP_OUTPUT_DIR:-${OUTPUT_ROOT}/ldp_${TIMESTAMP}}
 BASELINE_JSON=${BASELINE_JSON:-}
 
 if [[ -z "${BASELINE_JSON}" ]]; then
-  echo "BASELINE_JSON is required for pick-tube v2 training." >&2
-  exit 2
-fi
-if [[ ! -f "${BASELINE_JSON}" ]]; then
+  echo "warning: BASELINE_JSON is unset; training will run, but checkpoints will remain non-deployable and will not enter top-k." >&2
+elif [[ ! -f "${BASELINE_JSON}" ]]; then
   echo "Validation baseline JSON not found: ${BASELINE_JSON}" >&2
   exit 1
 fi

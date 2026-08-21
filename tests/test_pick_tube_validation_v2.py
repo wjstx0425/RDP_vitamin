@@ -159,7 +159,7 @@ def test_deployable_enforces_strict_idle_release_limits(metric_name, metric_valu
     assert result["val_deployable"] is False
 
 
-def test_v2_baseline_json_is_required_and_keeps_units_separate(tmp_path):
+def test_v2_baseline_json_is_optional_and_keeps_units_separate(tmp_path):
     config = OmegaConf.create(
         {
             "task": {"action_representation_version": 2},
@@ -167,8 +167,7 @@ def test_v2_baseline_json_is_required_and_keeps_units_separate(tmp_path):
         }
     )
 
-    with pytest.raises(ValueError, match="baseline_json"):
-        load_active_metric_baselines(config)
+    assert load_active_metric_baselines(config) is None
 
     baseline_path = tmp_path / "frozen-v1.json"
     baseline_path.write_text(
@@ -186,6 +185,23 @@ def test_v2_baseline_json_is_required_and_keeps_units_separate(tmp_path):
         "translation_mm": 1.25,
         "rotation_deg": 2.5,
     }
+
+
+def test_missing_baseline_keeps_checkpoint_fail_closed():
+    result = evaluate_checkpoint_feasibility(
+        idle_translation_29_mm=0.1,
+        idle_rotation_29_deg=0.1,
+        idle_translation_p95_mm=0.01,
+        idle_rotation_p95_deg=0.01,
+        active_translation_mm=0.1,
+        active_translation_baseline_mm=None,
+        active_rotation_deg=0.1,
+        active_rotation_baseline_deg=None,
+        micro_motion_recall=1.0,
+    )
+
+    assert result["val_checkpoint_feasible"] is False
+    assert result["val_deployable"] is False
 
 
 def test_seeded_validation_is_repeatable_and_preserves_global_rng():
@@ -274,3 +290,18 @@ def test_v2_experiment_launcher_uses_fresh_20_epoch_runs():
     assert '"RESUME=false"' in script
     assert "pca%d_armwise_rdp_zarr_v2" in script
     assert "BASELINE_JSON" in script
+
+
+def test_pick_tube_launchers_allow_missing_baseline():
+    root = Path(__file__).resolve().parents[1]
+    launchers = (
+        root / "scripts" / "run_pick_tube_rdp_experiments.sh",
+        root / "scripts" / "train_pick_tube_single_gpu.sh",
+        root / "scripts" / "train_pick_tube_server.sh",
+        root / "train_pick_tube_rdp.sh",
+    )
+
+    for launcher in launchers:
+        script = launcher.read_text(encoding="utf-8")
+        assert "BASELINE_JSON is required" not in script
+        assert "checkpoints will remain non-deployable" in script

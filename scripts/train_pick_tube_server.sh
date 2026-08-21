@@ -80,8 +80,8 @@ require_data() {
 
 require_baseline() {
   if [[ -z "${BASELINE_JSON}" ]]; then
-    echo "BASELINE_JSON is required for pick-tube v2 training." >&2
-    exit 2
+    echo "warning: BASELINE_JSON is unset; training will run, but checkpoints will remain non-deployable and will not enter top-k." >&2
+    return
   fi
   if [[ ! -f "${BASELINE_JSON}" ]]; then
     echo "Validation baseline JSON not found: ${BASELINE_JSON}" >&2
