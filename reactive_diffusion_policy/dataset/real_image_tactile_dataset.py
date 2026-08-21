@@ -37,6 +37,7 @@ class RealImageTactileDataset(BaseImageDataset):
                  transform_params=None,
                  load_to_memory=True,
                  bimanual_contiguous_action=False,
+                 allow_legacy_action_contract=False,
                  ):
         assert os.path.isdir(dataset_path)
 
@@ -61,7 +62,21 @@ class RealImageTactileDataset(BaseImageDataset):
                 extended_lowdim_keys.append(key)
 
         zarr_path = os.path.join(dataset_path, 'replay_buffer.zarr')
+        zarr_root = zarr.open_group(zarr_path, mode="r")
+        contract_keys = {"action_valid", "idle_arm_mask"}
+        present_contract_keys = contract_keys.intersection(zarr_root["data"].keys())
+        if present_contract_keys and present_contract_keys != contract_keys:
+            missing = sorted(contract_keys - present_contract_keys)
+            raise ValueError(f"incomplete v2 action contract; missing arrays: {missing}")
+        has_v2_action_contract = present_contract_keys == contract_keys
+        if not has_v2_action_contract and not allow_legacy_action_contract:
+            raise ValueError(
+                "dataset is missing action_valid and idle_arm_mask; pass "
+                "allow_legacy_action_contract=True only for an intentional legacy run"
+            )
         zarr_load_keys = set(rgb_keys + lowdim_keys + extended_rgb_keys + extended_lowdim_keys + ['action'])
+        if has_v2_action_contract:
+            zarr_load_keys.update(contract_keys)
         zarr_load_keys = list(filter(lambda key: "wrt" not in key, zarr_load_keys))
         if load_to_memory:
             replay_buffer = ReplayBuffer.copy_from_path(
@@ -91,6 +106,8 @@ class RealImageTactileDataset(BaseImageDataset):
         self.relative_action = relative_action
         self.relative_tcp_obs_for_relative_action = relative_tcp_obs_for_relative_action
         self.bimanual_contiguous_action = bimanual_contiguous_action
+        self.has_v2_action_contract = has_v2_action_contract
+        self.allow_legacy_action_contract = allow_legacy_action_contract
         self.transforms = None
         if relative_action or any('wrt' in key for key in lowdim_keys + extended_lowdim_keys):
             from reactive_diffusion_policy.real_world.real_world_transforms import RealWorldTransforms
@@ -117,7 +134,6 @@ class RealImageTactileDataset(BaseImageDataset):
 
         episode_repeats = None
         if use_episode_repeats:
-            zarr_root = zarr.open_group(zarr_path, mode="r")
             if "episode_repeats" in zarr_root["meta"]:
                 episode_repeats = zarr_root["meta"]["episode_repeats"][:]
 
@@ -246,6 +262,15 @@ class RealImageTactileDataset(BaseImageDataset):
         threadpool_limits(1)
         data = self.sampler.sample_sequence(idx)
 
+        if self.has_v2_action_contract:
+            valid_mask = data["action_valid"].astype(bool, copy=False)
+            idle_arm_mask = data["idle_arm_mask"].astype(bool, copy=False)
+        else:
+            valid_mask = np.zeros(self.sampler.sequence_length, dtype=bool)
+            _, _, sample_start, sample_end = self.sampler.indices[idx]
+            valid_mask[sample_start:sample_end] = True
+            idle_arm_mask = np.zeros((self.sampler.sequence_length, 2), dtype=bool)
+
         # to save RAM, only return first n_obs_steps of OBS
         # since the rest will be discarded anyway.
         # when self.n_obs_steps is None
@@ -294,6 +319,8 @@ class RealImageTactileDataset(BaseImageDataset):
         # observations are already taken care of by T_slice
         if self.n_latency_steps > 0:
             action = action[self.n_latency_steps:]
+            valid_mask = valid_mask[self.n_latency_steps:]
+            idle_arm_mask = idle_arm_mask[self.n_latency_steps:]
         
         if self.relative_action:
             from reactive_diffusion_policy.common.action_utils import absolute_actions_to_relative_actions
@@ -311,7 +338,9 @@ class RealImageTactileDataset(BaseImageDataset):
         torch_data = {
             'obs': dict_apply(obs_dict, torch.from_numpy),
             'action': torch.from_numpy(action),
-            'extended_obs': dict_apply(extended_obs_dict, torch.from_numpy)
+            'extended_obs': dict_apply(extended_obs_dict, torch.from_numpy),
+            'valid_mask': torch.from_numpy(valid_mask),
+            'idle_arm_mask': torch.from_numpy(idle_arm_mask),
         }
         return torch_data
 

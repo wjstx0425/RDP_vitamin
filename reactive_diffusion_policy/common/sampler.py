@@ -4,6 +4,20 @@ import numba
 from reactive_diffusion_policy.common.replay_buffer import ReplayBuffer
 
 
+def _canonical_action_suffix_value(last_action: np.ndarray) -> np.ndarray:
+    """Create a pick-tube 20D relative no-op from the final action widths."""
+    if last_action.shape != (20,):
+        return last_action
+    noop = np.zeros_like(last_action)
+    noop[3] = 1
+    noop[7] = 1
+    noop[9] = last_action[9]
+    noop[13] = 1
+    noop[17] = 1
+    noop[19] = last_action[19]
+    return noop
+
+
 @numba.jit(nopython=True)
 def create_indices(
     episode_ends:np.ndarray, sequence_length:int, 
@@ -175,9 +189,13 @@ class SequenceSampler:
                     shape=(self.sequence_length,) + input_arr.shape[1:],
                     dtype=input_arr.dtype)
                 if sample_start_idx > 0:
-                    data[:sample_start_idx] = sample[0]
+                    if key not in ("action_valid", "idle_arm_mask"):
+                        data[:sample_start_idx] = sample[0]
                 if sample_end_idx < self.sequence_length:
-                    data[sample_end_idx:] = sample[-1]
+                    if key == "action":
+                        data[sample_end_idx:] = _canonical_action_suffix_value(sample[-1])
+                    elif key not in ("action_valid", "idle_arm_mask"):
+                        data[sample_end_idx:] = sample[-1]
                 data[sample_start_idx:sample_end_idx] = sample
             result[key] = data
         return result

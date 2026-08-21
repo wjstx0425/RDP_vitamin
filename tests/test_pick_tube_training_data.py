@@ -1,5 +1,6 @@
 from pathlib import Path
 import numpy as np
+import pytest
 import torch
 import torchvision
 from hydra import compose, initialize_config_dir
@@ -37,6 +38,99 @@ def test_sequence_sampler_repeats_selected_episodes_only():
     )
 
     assert sampler.indices[:, 0].tolist() == [0, 1, 2, 3, 4, 3, 4]
+
+
+def test_sequence_sampler_uses_canonical_noop_for_action_suffix():
+    replay_buffer = ReplayBuffer.create_empty_numpy()
+    action = np.zeros((2, 20), dtype=np.float32)
+    action[:, 0] = [0.001, 0.002]
+    action[:, 3] = 1
+    action[:, 7] = 1
+    action[:, 9] = [0.02, 0.03]
+    action[:, 10] = [0.004, 0.005]
+    action[:, 13] = 1
+    action[:, 17] = 1
+    action[:, 19] = [0.03, 0.04]
+    replay_buffer.add_episode(
+        {
+            "action": action,
+            "action_valid": np.array([True, False]),
+            "idle_arm_mask": np.array([[True, False], [False, True]]),
+            "value": np.arange(2, dtype=np.float32)[:, None],
+        }
+    )
+    sampler = SequenceSampler(
+        replay_buffer=replay_buffer,
+        sequence_length=4,
+        pad_after=2,
+    )
+
+    sample = sampler.sample_sequence(0)
+
+    np.testing.assert_allclose(sample["action"][2:, :3], 0.0)
+    np.testing.assert_allclose(
+        sample["action"][2:, 3:9], np.tile([1, 0, 0, 0, 1, 0], (2, 1))
+    )
+    np.testing.assert_allclose(sample["action"][2:, 9], 0.03)
+    np.testing.assert_allclose(sample["action"][2:, 10:13], 0.0)
+    np.testing.assert_allclose(
+        sample["action"][2:, 13:19], np.tile([1, 0, 0, 0, 1, 0], (2, 1))
+    )
+    np.testing.assert_allclose(sample["action"][2:, 19], 0.04)
+    assert not sample["action_valid"][2:].any()
+    assert not sample["idle_arm_mask"][2:].any()
+    np.testing.assert_array_equal(sample["value"][2:], [[1], [1]])
+
+
+def _write_minimal_action_dataset(path, include_v2_arrays):
+    replay_buffer = ReplayBuffer.create_empty_numpy()
+    episode = {"action": np.zeros((2, 20), dtype=np.float32)}
+    episode["action"][:, 3] = 1
+    episode["action"][:, 7] = 1
+    episode["action"][:, 13] = 1
+    episode["action"][:, 17] = 1
+    if include_v2_arrays:
+        episode["action_valid"] = np.array([True, False])
+        episode["idle_arm_mask"] = np.array([[True, False], [False, False]])
+    replay_buffer.add_episode(episode)
+    path.mkdir()
+    replay_buffer.save_to_path(path / "replay_buffer.zarr")
+
+
+def _minimal_dataset(path, **kwargs):
+    return RealImageTactileDataset(
+        shape_meta={"obs": {}, "action": {"shape": [20]}},
+        dataset_path=str(path),
+        horizon=2,
+        use_episode_repeats=False,
+        **kwargs,
+    )
+
+
+def test_dataset_exposes_v2_masks_at_top_level(tmp_path):
+    dataset_path = tmp_path / "v2"
+    _write_minimal_action_dataset(dataset_path, include_v2_arrays=True)
+
+    sample = _minimal_dataset(dataset_path)[0]
+
+    assert sample["valid_mask"].dtype == torch.bool
+    assert sample["idle_arm_mask"].dtype == torch.bool
+    torch.testing.assert_close(sample["valid_mask"], torch.tensor([True, False]))
+    torch.testing.assert_close(
+        sample["idle_arm_mask"], torch.tensor([[True, False], [False, False]])
+    )
+
+
+def test_dataset_requires_explicit_legacy_action_contract_opt_in(tmp_path):
+    dataset_path = tmp_path / "legacy"
+    _write_minimal_action_dataset(dataset_path, include_v2_arrays=False)
+
+    with pytest.raises(ValueError, match="allow_legacy_action_contract"):
+        _minimal_dataset(dataset_path)
+
+    sample = _minimal_dataset(dataset_path, allow_legacy_action_contract=True)[0]
+    torch.testing.assert_close(sample["valid_mask"], torch.ones(2, dtype=torch.bool))
+    torch.testing.assert_close(sample["idle_arm_mask"], torch.zeros((2, 2), dtype=torch.bool))
 
 
 def test_color_jitter_is_bypassed_in_eval_mode():

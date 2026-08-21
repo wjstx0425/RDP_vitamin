@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,20 @@ from numcodecs import Blosc
 from PIL import Image
 from tqdm.auto import tqdm
 
+from reactive_diffusion_policy.common.pick_tube_action_contract import (
+    ACTION_CONTRACT,
+    ACTION_REPRESENTATION_VERSION,
+    HIGH_GRIPPER_DELTA_M,
+    HIGH_ROTATION_DELTA_DEG,
+    HIGH_TRANSLATION_DELTA_M,
+    IDLE_ENTRY_FRAMES,
+    IDLE_EXIT_FRAMES,
+    LOW_GRIPPER_DELTA_M,
+    LOW_ROTATION_DELTA_DEG,
+    LOW_TRANSLATION_DELTA_M,
+    TERMINAL_ACTION_POLICY,
+    canonicalize_episode_actions,
+)
 from reactive_diffusion_policy.model.tactile_pca import BimanualTactilePCA
 
 
@@ -130,6 +146,80 @@ def append(array: zarr.Array, values: np.ndarray) -> None:
     array[old_length:] = values
 
 
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stable_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def converter_git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parent,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def build_v2_manifest(
+    *,
+    arrays: dict[str, zarr.Array],
+    pca_path: Path,
+    tactile_embedding_dim: int,
+    episode_manifest: list[dict],
+    repair_counts: dict[str, int],
+    idle_coverage_by_source: dict[str, dict[str, float]],
+    git_commit: str,
+) -> dict:
+    """Build the JSON-serializable audit manifest for a completed conversion."""
+    return {
+        "action_representation_version": ACTION_REPRESENTATION_VERSION,
+        "action_contract": ACTION_CONTRACT,
+        "normalizer_version": "zero_centered_v2",
+        "terminal_action_policy": TERMINAL_ACTION_POLICY,
+        "idle_thresholds": {
+            "low": {
+                "translation_m": LOW_TRANSLATION_DELTA_M,
+                "rotation_deg": LOW_ROTATION_DELTA_DEG,
+                "gripper_m": LOW_GRIPPER_DELTA_M,
+            },
+            "high": {
+                "translation_m": HIGH_TRANSLATION_DELTA_M,
+                "rotation_deg": HIGH_ROTATION_DELTA_DEG,
+                "gripper_m": HIGH_GRIPPER_DELTA_M,
+            },
+            "entry_frames": IDLE_ENTRY_FRAMES,
+            "exit_frames": IDLE_EXIT_FRAMES,
+        },
+        "repair_counts": dict(repair_counts),
+        "idle_coverage_by_source": idle_coverage_by_source,
+        "arrays": {
+            key: {"shape": list(array.shape), "dtype": str(np.dtype(array.dtype))}
+            for key, array in sorted(arrays.items())
+        },
+        "pca_sha256": sha256_file(Path(pca_path)),
+        "pca_output_dim": int(tactile_embedding_dim),
+        "pca_sensor_to_arm_order": ["left", "right"],
+        "source_episodes": episode_manifest,
+        "dataset_digest": stable_json_sha256(episode_manifest),
+        "converter_git_commit": git_commit,
+    }
+
+
 def create_output(
     path: Path, tactile_embedding_dim: int
 ) -> tuple[zarr.Group, dict[str, zarr.Array]]:
@@ -157,6 +247,15 @@ def create_output(
         "action": data.create_dataset(
             "action", shape=(0, 20), chunks=(2048, 20), dtype="f4", compressor=compressor
         ),
+        "action_raw": data.create_dataset(
+            "action_raw", shape=(0, 20), chunks=(2048, 20), dtype="f4", compressor=compressor
+        ),
+        "action_valid": data.create_dataset(
+            "action_valid", shape=(0,), chunks=(2048,), dtype="bool", compressor=compressor
+        ),
+        "idle_arm_mask": data.create_dataset(
+            "idle_arm_mask", shape=(0, 2), chunks=(2048, 2), dtype="bool", compressor=compressor
+        ),
     }
     return root, arrays
 
@@ -183,6 +282,11 @@ def main() -> None:
     episode_ends: list[int] = []
     episode_repeats: list[int] = []
     episode_dataset_ids: list[int] = []
+    episode_manifest: list[dict] = []
+    source_idle_counts = {
+        dataset_name: np.zeros(2, dtype=np.int64) for dataset_name in args.datasets
+    }
+    source_valid_counts = {dataset_name: 0 for dataset_name in args.datasets}
     total_frames = 0
 
     progress = tqdm(
@@ -229,18 +333,35 @@ def main() -> None:
             if tactile.shape != (expected_length, tactile_embedding_dim):
                 raise ValueError(f"{dataset_name} episode {episode_index}: tactile shape mismatch")
 
+            canonical_actions = canonicalize_episode_actions(state, action)
+
             for key, values in (
                 ("camera1", camera1),
                 ("camera2", camera2),
                 ("observation_state", state),
                 ("tactile_embedding", tactile),
-                ("action", action),
+                ("action_raw", canonical_actions.action_raw),
+                ("action", canonical_actions.action),
+                ("action_valid", canonical_actions.action_valid),
+                ("idle_arm_mask", canonical_actions.idle_arm_mask),
             ):
                 append(arrays[key], values)
+            source_idle_counts[dataset_name] += canonical_actions.idle_arm_mask.sum(axis=0)
+            source_valid_counts[dataset_name] += int(canonical_actions.action_valid.sum())
             total_frames += expected_length
             episode_ends.append(total_frames)
-            episode_repeats.append(dataset_repeats.get(dataset_name, 1))
+            repeat = dataset_repeats.get(dataset_name, 1)
+            episode_repeats.append(repeat)
             episode_dataset_ids.append(dataset_id)
+            episode_manifest.append(
+                {
+                    "dataset": dataset_name,
+                    "dataset_id": dataset_id,
+                    "episode_index": episode_index,
+                    "length": expected_length,
+                    "repeat": repeat,
+                }
+            )
             progress.update(expected_length)
 
     progress.close()
@@ -266,6 +387,32 @@ def main() -> None:
     root["meta"].attrs["dataset_names"] = list(args.datasets)
     root["meta"].attrs["tactile_pca_path"] = str(args.tactile_pca_path.resolve())
     root["meta"].attrs["tactile_embedding_dim"] = tactile_embedding_dim
+    idle_coverage_by_source = {}
+    for dataset_name in args.datasets:
+        denominator = source_valid_counts[dataset_name]
+        counts = source_idle_counts[dataset_name]
+        idle_coverage_by_source[dataset_name] = {
+            "left": float(counts[0] / denominator) if denominator else 0.0,
+            "right": float(counts[1] / denominator) if denominator else 0.0,
+        }
+    repair_counts = {
+        "terminal_actions": len(episode_manifest),
+        "invalid_nonterminal_actions": 0,
+        "idle_frames_left": int(sum(counts[0] for counts in source_idle_counts.values())),
+        "idle_frames_right": int(sum(counts[1] for counts in source_idle_counts.values())),
+    }
+    manifest = build_v2_manifest(
+        arrays=arrays,
+        pca_path=args.tactile_pca_path,
+        tactile_embedding_dim=tactile_embedding_dim,
+        episode_manifest=episode_manifest,
+        repair_counts=repair_counts,
+        idle_coverage_by_source=idle_coverage_by_source,
+        git_commit=converter_git_commit(),
+    )
+    root["meta"].attrs["v2_manifest_json"] = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")
+    )
     starts = [0, *episode_ends[:-1]]
     effective_frames = sum(
         (end - start) * repeat
