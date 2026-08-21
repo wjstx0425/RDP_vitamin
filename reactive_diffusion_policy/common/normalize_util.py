@@ -235,14 +235,56 @@ def concatenate_normalizer(normalizers: list):
         input_stats_dict=input_stats_dict
     )
 
-def get_action_normalizer(actions: np.ndarray, temporally_independent_normalization=False, bimanual_contiguous=False):
+def _get_zero_centered_translation_normalizer(actions, quantile=0.995, range_eps=1e-7):
+    stat = array_to_stats(actions)
+    robust_extent = np.quantile(np.abs(actions), quantile, axis=0)
+    robust_extent = np.asarray(robust_extent, dtype=actions.dtype)
+    scale = 1.0 / np.maximum(robust_extent, np.asarray(range_eps, dtype=actions.dtype))
+    offset = np.zeros_like(scale)
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=scale,
+        offset=offset,
+        input_stats_dict=stat,
+    )
+
+
+def _get_identity_residual_rotation_normalizer(actions):
+    stat = array_to_stats(actions)
+    identity_6d = np.asarray([1, 0, 0, 0, 1, 0], dtype=actions.dtype)
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=np.ones_like(identity_6d),
+        offset=-identity_6d,
+        input_stats_dict=stat,
+    )
+
+
+def get_action_normalizer(
+        actions: np.ndarray,
+        temporally_independent_normalization=False,
+        bimanual_contiguous=False,
+        version: str = "legacy_v1"):
     assert not temporally_independent_normalization, "Not use temporally independent normalization now"
     assert len(actions.shape) == 2 or len(actions.shape) == 3
+    if version not in {"legacy_v1", "zero_centered_v2"}:
+        raise ValueError(f"unsupported action normalizer version: {version}")
     if not temporally_independent_normalization:
         actions = actions.reshape(-1, actions.shape[-1])
 
     D = actions.shape[-1]
-    if D == 3 or D == 4 or D == 6 or D == 8: # (x, y, z, gripper_width)
+    if version == "zero_centered_v2":
+        if D != 20 or not bimanual_contiguous:
+            raise ValueError(
+                "zero_centered_v2 requires the contiguous 20D bimanual action layout"
+            )
+        normalizers = [
+            _get_zero_centered_translation_normalizer(actions[..., :3]),
+            _get_identity_residual_rotation_normalizer(actions[..., 3:9]),
+            get_range_normalizer_from_stat(array_to_stats(actions[..., 9:10])),
+            _get_zero_centered_translation_normalizer(actions[..., 10:13]),
+            _get_identity_residual_rotation_normalizer(actions[..., 13:19]),
+            get_range_normalizer_from_stat(array_to_stats(actions[..., 19:20])),
+        ]
+    elif D == 3 or D == 4 or D == 6 or D == 8: # (x, y, z, gripper_width)
         normalizers = [get_range_normalizer_from_stat(array_to_stats(actions))]
     elif D == 9 or D == 10: # (x, y, z, rx1, rx2, rx3, ry1, ry2, ry3)
         normalizers = []

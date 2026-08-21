@@ -43,6 +43,7 @@ dataset:
   transform_params: null
   load_to_memory: false
   bimanual_contiguous_action: true
+  action_normalizer_version: zero_centered_v2
   use_latent_action_before_vq: false
   at:
     _target_: reactive_diffusion_policy.model.vae.model.VAE
@@ -62,3 +63,12 @@ dataset:
     eval: true
     load_dir: ${at_load_dir}
     act_scale: ${at.policy.act_scale}
+    action_loss_version: ${at.policy.action_loss_version}
+    position_scale: ${at.policy.position_scale}
+    rotation_scale: ${at.policy.rotation_scale}
+    gripper_scale: ${at.policy.gripper_scale}
+    idle_position_scale: ${at.policy.idle_position_scale}
+    idle_rotation_scale: ${at.policy.idle_rotation_scale}
+    idle_weight: ${at.policy.idle_weight}
+    degenerate_weight: ${at.policy.degenerate_weight}
+    rot6_aux_weight: ${at.policy.rot6_aux_weight}

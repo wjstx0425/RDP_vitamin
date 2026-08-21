@@ -36,3 +36,4 @@ dataset:
   transform_params: null
   load_to_memory: false
   bimanual_contiguous_action: true
+  action_normalizer_version: zero_centered_v2

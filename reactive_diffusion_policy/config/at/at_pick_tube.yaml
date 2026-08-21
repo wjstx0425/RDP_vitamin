@@ -18,3 +18,12 @@ policy:
   vqvae_groups: 4
   eval: false
   act_scale: 1
+  action_loss_version: physical_v2
+  position_scale: 0.001
+  rotation_scale: 0.017453292519943295
+  gripper_scale: 0.005
+  idle_position_scale: 0.0001
+  idle_rotation_scale: 0.0008726646259971648
+  idle_weight: 1.0
+  degenerate_weight: 1.0
+  rot6_aux_weight: 0.05

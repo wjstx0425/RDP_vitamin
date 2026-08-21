@@ -2,10 +2,16 @@
 Modified from VQ-BeT https://github.com/jayLEE0301/vq_bet_official
 Some code is adapted from Stable Diffusion https://github.com/CompVis/stable-diffusion
 """
+import math
+
 import torch.nn
 import einops
 from reactive_diffusion_policy.model.common.normalizer import LinearNormalizer
 from reactive_diffusion_policy.model.common.shape_util import get_output_shape
+from reactive_diffusion_policy.model.vae.physical_action_loss import (
+    compute_bimanual_physical_loss,
+    project_rotation_6d,
+)
 from reactive_diffusion_policy.model.vae.vector_quantize_pytorch.residual_vq import ResidualVQ
 from reactive_diffusion_policy.model.vae.distributions import DiagonalGaussianDistribution
 from reactive_diffusion_policy.model.vae.utils import *
@@ -119,6 +125,16 @@ class VAE:
         load_dir=None,
         encoder_loss_multiplier=1.0,
         act_scale=1.0,
+        action_loss_version="legacy_v1",
+        position_scale=1e-3,
+        rotation_scale=math.radians(1.0),
+        gripper_scale=5e-3,
+        idle_position_scale=1e-4,
+        idle_rotation_scale=math.radians(0.05),
+        idle_weight=1.0,
+        degenerate_weight=1.0,
+        rot6_aux_weight=0.0,
+        physical_loss_weights=None,
     ):
         self.input_dim_h = horizon
         self.input_dim_w = shape_meta['action']['shape'][0]
@@ -135,6 +151,23 @@ class VAE:
         self.device = device
         self.encoder_loss_multiplier = encoder_loss_multiplier
         self.act_scale = act_scale
+        if action_loss_version not in {"legacy_v1", "physical_v2"}:
+            raise ValueError(f"unsupported action loss version: {action_loss_version}")
+        if action_loss_version == "physical_v2" and self.input_dim_w != 20:
+            raise ValueError("physical_v2 requires 20D bimanual actions")
+        self.action_loss_version = action_loss_version
+        self.physical_loss_weights = {
+            "position_scale": position_scale,
+            "rotation_scale": rotation_scale,
+            "gripper_scale": gripper_scale,
+            "idle_position_scale": idle_position_scale,
+            "idle_rotation_scale": idle_rotation_scale,
+            "idle_weight": idle_weight,
+            "degenerate_weight": degenerate_weight,
+            "rot6_aux_weight": rot6_aux_weight,
+        }
+        if physical_loss_weights is not None:
+            self.physical_loss_weights.update(dict(physical_loss_weights))
 
         self.normalizer = LinearNormalizer()
 
@@ -205,17 +238,23 @@ class VAE:
 
     def get_action_from_latent(self, latent):
         output = self.decoder(latent) * self.act_scale
-        if self.input_dim_h == 1:
-            return einops.rearrange(output, "N (T A) -> N T A", A=self.input_dim_w)
-        else:
-            return einops.rearrange(output, "N (T A) -> N T A", A=self.input_dim_w)
+        action = einops.rearrange(output, "N (T A) -> N T A", A=self.input_dim_w)
+        return self._project_v2_action_rotations(action)
 
     def get_action_from_latent_with_temporal_cond(self, latent, temporal_cond):
         output = self.decoder(latent, temporal_cond) * self.act_scale
-        if self.input_dim_h == 1:
-            return einops.rearrange(output, "N (T A) -> N T A", A=self.input_dim_w)
-        else:
-            return einops.rearrange(output, "N (T A) -> N T A", A=self.input_dim_w)
+        action = einops.rearrange(output, "N (T A) -> N T A", A=self.input_dim_w)
+        return self._project_v2_action_rotations(action)
+
+    def _project_v2_action_rotations(self, normalized_action):
+        if self.action_loss_version != "physical_v2":
+            return normalized_action
+        physical_action = self.normalizer['action'].unnormalize(normalized_action)
+        projected_action = physical_action.clone()
+        for rotation_slice in (slice(3, 9), slice(13, 19)):
+            rotation, _ = project_rotation_6d(physical_action[..., rotation_slice])
+            projected_action[..., rotation_slice] = rotation[..., :2, :].flatten(-2)
+        return self.normalizer['action'].normalize(projected_action)
 
     def preprocess(self, state):
         if not torch.is_tensor(state):
@@ -276,10 +315,8 @@ class VAE:
 
     def compute_loss_and_metric(self, batch):
 
-        state = batch["action"]
-        state = self.normalizer['action'].normalize(state)
-        state = state / self.act_scale
-        state = self.preprocess(state)
+        normalized_action = self.normalizer['action'].normalize(batch["action"])
+        state = self.preprocess(normalized_action / self.act_scale)
 
         state_rep = self.encoder(state)
         if self.use_vq:
@@ -295,7 +332,25 @@ class VAE:
         else:
             dec_out = self.decoder(state_vq)
 
-        encoder_loss = (state - dec_out).abs().mean()
+        physical_losses = None
+        if self.action_loss_version == "physical_v2":
+            predicted_normalized_action = einops.rearrange(
+                dec_out, "N (T A) -> N T A", T=self.input_dim_h, A=self.input_dim_w
+            ) * self.act_scale
+            target_action = self.normalizer['action'].unnormalize(normalized_action)
+            predicted_action = self.normalizer['action'].unnormalize(
+                predicted_normalized_action
+            )
+            physical_losses = compute_bimanual_physical_loss(
+                target=target_action,
+                prediction=predicted_action,
+                valid_mask=batch["valid_mask"],
+                idle_arm_mask=batch["idle_arm_mask"],
+                weights=self.physical_loss_weights,
+            )
+            encoder_loss = physical_losses["loss"]
+        else:
+            encoder_loss = (state - dec_out).abs().mean()
         vae_recon_loss = torch.nn.MSELoss()(state, dec_out)
 
         return_dict = {
@@ -303,6 +358,12 @@ class VAE:
             "encoder_loss": encoder_loss.clone().detach().cpu().numpy(),
             "vae_recon_loss": vae_recon_loss.item(),
         }
+        if physical_losses is not None:
+            return_dict.update({
+                name: value.detach().cpu().item()
+                for name, value in physical_losses.items()
+                if name != "loss"
+            })
 
         if self.use_vq:
             rep_loss = encoder_loss * self.encoder_loss_multiplier + (vq_loss_state * 5)
@@ -344,6 +405,7 @@ class VAE:
     def to(self, device):
         self.encoder.to(device)
         self.decoder.to(device)
+        self.normalizer.to(device)
         if self.use_vq:
             self.vq_layer.to(device)
         else:

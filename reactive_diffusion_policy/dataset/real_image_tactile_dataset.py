@@ -38,6 +38,7 @@ class RealImageTactileDataset(BaseImageDataset):
                  load_to_memory=True,
                  bimanual_contiguous_action=False,
                  allow_legacy_action_contract=False,
+                 action_normalizer_version: str = "legacy_v1",
                  ):
         assert os.path.isdir(dataset_path)
 
@@ -106,6 +107,7 @@ class RealImageTactileDataset(BaseImageDataset):
         self.relative_action = relative_action
         self.relative_tcp_obs_for_relative_action = relative_tcp_obs_for_relative_action
         self.bimanual_contiguous_action = bimanual_contiguous_action
+        self.action_normalizer_version = action_normalizer_version
         self.has_v2_action_contract = has_v2_action_contract
         self.allow_legacy_action_contract = allow_legacy_action_contract
         self.transforms = None
@@ -192,6 +194,17 @@ class RealImageTactileDataset(BaseImageDataset):
             start = end
         return np.concatenate(chunks, axis=0)
 
+    def _get_training_mask(self, key):
+        values = self.replay_buffer[key]
+        episode_ends = self.replay_buffer.episode_ends[:]
+        chunks = []
+        start = 0
+        for include, end in zip(self.train_mask, episode_ends):
+            if include:
+                chunks.append(np.asarray(values[start:end], dtype=bool))
+            start = end
+        return np.concatenate(chunks, axis=0)
+
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
 
@@ -218,9 +231,14 @@ class RealImageTactileDataset(BaseImageDataset):
             action_all = relative_data_dict['action']
         else:
             action_all = self._get_training_rows('action', self.shape_meta['action']['shape'][0])
+        if self.action_normalizer_version == "zero_centered_v2":
+            action_all = action_all[self._get_training_mask("action_valid")]
 
         normalizer['action'] = get_action_normalizer(
-            action_all, bimanual_contiguous=self.bimanual_contiguous_action)
+            action_all,
+            bimanual_contiguous=self.bimanual_contiguous_action,
+            version=self.action_normalizer_version,
+        )
 
         # obs
         for key in list(set(self.lowdim_keys)):
