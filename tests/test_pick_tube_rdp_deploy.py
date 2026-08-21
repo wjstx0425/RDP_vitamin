@@ -122,7 +122,24 @@ class LoadedFakePolicy:
         return self
 
 
-def policy_cfg(tactile_dim: int):
+def artifact_manifest(**overrides):
+    value = {
+        "schema_version": 2,
+        "dataset_digest": "d" * 64,
+        "split_digest": "s" * 64,
+        "action_representation_version": 2,
+        "action_contract": "bimanual_relative_pose20d_v2",
+        "normalizer_version": "zero_centered_v2",
+        "normalizer_sha256": "n" * 64,
+        "pca_sha256": "p" * 64,
+        "tactile_cache_sha256": "t" * 64,
+        "git_commit": "training-commit",
+    }
+    value.update(overrides)
+    return value
+
+
+def policy_cfg(tactile_dim: int, artifacts=None):
     cfg = tactile_cfg(tactile_dim)
     cfg._target_ = "tests.FakeWorkspace"
     cfg.policy = {
@@ -130,6 +147,8 @@ def policy_cfg(tactile_dim: int):
         "obs_encoder": {"random_transforms": []},
     }
     cfg.training = {"use_ema": True}
+    if artifacts is not None:
+        cfg.artifacts = artifacts
     return cfg
 
 
@@ -309,13 +328,15 @@ def test_load_policy_validates_matching_payloads_before_workspace_construction(m
     monkeypatch.setattr(deploy, "validate_tactile_dimensions", validate)
     monkeypatch.setattr(deploy.hydra.utils, "get_class", lambda target: FakeWorkspace)
 
-    policy, cfg = deploy.load_policy(
-        ldp_checkpoint,
-        at_checkpoint,
-        torch.device("cpu"),
-        num_inference_steps=7,
-        tactile_embedding_dim=30,
-    )
+    with pytest.warns(UserWarning, match="legacy"):
+        policy, cfg = deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=7,
+            tactile_embedding_dim=30,
+            artifact_verification="legacy-compatible",
+        )
 
     assert payload_calls == [(ldp_checkpoint, "LDP"), (at_checkpoint, "AT")]
     assert len(workspace_instances) == 1
@@ -371,6 +392,163 @@ def test_load_policy_rejects_each_mismatched_tactile_dimension_before_workspace(
             torch.device("cpu"),
             num_inference_steps=8,
             tactile_embedding_dim=pca_dim,
+            artifact_verification="legacy-compatible",
+        )
+
+
+def _install_fake_policy_load(monkeypatch, ldp_cfg, at_cfg):
+    class FakeWorkspace:
+        def __init__(self, cfg):
+            self.ema_model = LoadedFakePolicy()
+            self.model = LoadedFakePolicy()
+
+        def load_payload(self, loaded_payload):
+            pass
+
+    monkeypatch.setattr(
+        deploy,
+        "_load_checkpoint_payload",
+        lambda path, role: payload(ldp_cfg if role == "LDP" else at_cfg),
+    )
+    monkeypatch.setattr(deploy.hydra.utils, "get_class", lambda target: FakeWorkspace)
+
+
+def test_load_policy_strict_accepts_exact_v2_bundle(tmp_path, monkeypatch) -> None:
+    at_path = tmp_path / "at.ckpt"
+    at_path.write_bytes(b"AT checkpoint")
+    pca_path = tmp_path / "pca.npz"
+    pca_path.write_bytes(b"PCA artifact")
+    at_artifacts = artifact_manifest(pca_sha256=deploy.sha256_file(pca_path))
+    ldp_artifacts = artifact_manifest(
+        normalizer_sha256="l" * 64,
+        pca_sha256=deploy.sha256_file(pca_path),
+        at_sha256=deploy.sha256_file(at_path),
+        latent_target_mode="posterior_mode_post_vq",
+    )
+    _install_fake_policy_load(
+        monkeypatch,
+        policy_cfg(30, ldp_artifacts),
+        policy_cfg(30, at_artifacts),
+    )
+
+    policy, _ = deploy.load_policy(
+        tmp_path / "ldp.ckpt",
+        at_path,
+        torch.device("cpu"),
+        num_inference_steps=8,
+        tactile_embedding_dim=30,
+        artifact_verification="strict",
+        tactile_pca_path=pca_path,
+    )
+
+    assert policy.eval_called
+
+
+@pytest.mark.parametrize(
+    ("ldp_change", "message"),
+    [
+        ({"at_sha256": "x" * 64}, "AT"),
+        ({"pca_sha256": "x" * 64}, "PCA"),
+    ],
+)
+def test_load_policy_strict_rejects_same_dimension_different_artifact(
+    tmp_path, monkeypatch, ldp_change, message
+) -> None:
+    at_path = tmp_path / "at.ckpt"
+    at_path.write_bytes(b"AT checkpoint")
+    pca_path = tmp_path / "pca.npz"
+    pca_path.write_bytes(b"PCA artifact")
+    pca_sha256 = deploy.sha256_file(pca_path)
+    at_artifacts = artifact_manifest(pca_sha256=pca_sha256)
+    ldp_artifacts = artifact_manifest(
+        **{
+            "normalizer_sha256": "l" * 64,
+            "pca_sha256": pca_sha256,
+            "at_sha256": deploy.sha256_file(at_path),
+            "latent_target_mode": "posterior_mode_post_vq",
+            **ldp_change,
+        }
+    )
+    _install_fake_policy_load(
+        monkeypatch,
+        policy_cfg(30, ldp_artifacts),
+        policy_cfg(30, at_artifacts),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        deploy.load_policy(
+            tmp_path / "ldp.ckpt",
+            at_path,
+            torch.device("cpu"),
+            8,
+            30,
+            artifact_verification="strict",
+            tactile_pca_path=pca_path,
+        )
+
+
+def test_load_policy_strict_rejects_v1_v2_mixing(tmp_path, monkeypatch) -> None:
+    at_path = tmp_path / "at.ckpt"
+    at_path.write_bytes(b"AT checkpoint")
+    _install_fake_policy_load(
+        monkeypatch,
+        policy_cfg(
+            30,
+            artifact_manifest(
+                at_sha256=deploy.sha256_file(at_path),
+                latent_target_mode="posterior_mode_post_vq",
+            ),
+        ),
+        policy_cfg(30),
+    )
+
+    with pytest.raises(ValueError, match="AT.*artifacts"):
+        deploy.load_policy(
+            tmp_path / "ldp.ckpt",
+            at_path,
+            torch.device("cpu"),
+            8,
+            30,
+            artifact_verification="strict",
+        )
+
+
+def test_load_policy_strict_rejects_missing_v2_metadata(monkeypatch) -> None:
+    _install_fake_policy_load(monkeypatch, policy_cfg(30), policy_cfg(30))
+
+    with pytest.raises(ValueError, match="LDP.*artifacts"):
+        deploy.load_policy(
+            Path("ldp.ckpt"),
+            Path("at.ckpt"),
+            torch.device("cpu"),
+            8,
+            30,
+            artifact_verification="strict",
+        )
+
+
+def test_legacy_metadata_requires_explicit_compatibility_mode(monkeypatch) -> None:
+    _install_fake_policy_load(monkeypatch, policy_cfg(30), policy_cfg(30))
+
+    with pytest.warns(UserWarning, match="legacy"):
+        policy, _ = deploy.load_policy(
+            Path("ldp.ckpt"),
+            Path("at.ckpt"),
+            torch.device("cpu"),
+            8,
+            30,
+            artifact_verification="legacy-compatible",
+        )
+    assert policy.eval_called
+
+    with pytest.raises(ValueError, match="artifact_verification"):
+        deploy.load_policy(
+            Path("ldp.ckpt"),
+            Path("at.ckpt"),
+            torch.device("cpu"),
+            8,
+            30,
+            artifact_verification="off",
         )
 
 

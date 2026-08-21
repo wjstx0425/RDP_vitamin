@@ -27,6 +27,11 @@ from reactive_diffusion_policy.dataset.base_dataset import BaseImageDataset
 from reactive_diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from reactive_diffusion_policy.common.json_logger import JsonLogger
 from reactive_diffusion_policy.model.common.lr_scheduler import get_scheduler
+from reactive_diffusion_policy.common.artifact_manifest import (
+    build_normalizer_cache_signature,
+    load_normalizer_cache,
+    save_normalizer_cache,
+)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -133,7 +138,19 @@ class TrainATWorkspace(BaseWorkspace):
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        normalizer = dataset.get_normalizer()
+        normalizer_path = pathlib.Path(self.output_dir) / "normalizer.pkl"
+        normalizer_signature = build_normalizer_cache_signature(cfg, dataset, None)
+        normalizer = load_normalizer_cache(normalizer_path, normalizer_signature)
+        if normalizer is None:
+            normalizer = dataset.get_normalizer()
+            save_normalizer_cache(normalizer_path, normalizer, normalizer_signature)
+        else:
+            print(f"Reusing normalizer from {normalizer_path}")
+        self.bind_checkpoint_artifacts(
+            normalizer_signature,
+            normalizer_path=normalizer_path,
+            role="AT",
+        )
         if resumed and not resumed_optimizer_step:
             self.optimizer_step = get_legacy_optimizer_step(
                 completed_epochs=self.epoch,

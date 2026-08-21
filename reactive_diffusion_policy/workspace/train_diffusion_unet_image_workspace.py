@@ -19,7 +19,6 @@ import wandb
 import tqdm
 import numpy as np
 import shutil
-import pickle
 from reactive_diffusion_policy.workspace.base_workspace import BaseWorkspace
 from reactive_diffusion_policy.policy.diffusion_unet_image_policy import DiffusionUnetImagePolicy
 from reactive_diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -29,6 +28,11 @@ from reactive_diffusion_policy.common.pytorch_util import dict_apply, optimizer_
 from reactive_diffusion_policy.model.diffusion.ema_model import EMAModel
 from reactive_diffusion_policy.model.common.lr_scheduler import get_scheduler
 from reactive_diffusion_policy.model.common.lr_decay import param_groups_lrd
+from reactive_diffusion_policy.common.artifact_manifest import (
+    build_normalizer_cache_signature,
+    load_normalizer_cache,
+    save_normalizer_cache,
+)
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from reactive_diffusion_policy.workspace.train_at_workspace import (
@@ -175,20 +179,30 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 accumulate_every=cfg.training.gradient_accumulate_every,
             )
         
-        # normalizer = dataset.get_normalizer()
-        # compute normalizer on the main process and save to disk
-        normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
+        at_path_value = OmegaConf.select(cfg, "at_load_dir")
+        if not at_path_value:
+            raise ValueError("LDP training requires at_load_dir for artifact binding")
+        at_path = pathlib.Path(str(at_path_value))
+        normalizer_signature = build_normalizer_cache_signature(cfg, dataset, at_path)
+        normalizer_path = pathlib.Path(self.output_dir) / "normalizer.pkl"
         if accelerator.is_main_process:
-            if os.path.isfile(normalizer_path):
+            normalizer = load_normalizer_cache(normalizer_path, normalizer_signature)
+            if normalizer is not None:
                 accelerator.print(f"Reusing normalizer from {normalizer_path}")
             else:
                 normalizer = dataset.get_normalizer()
-                with open(normalizer_path, 'wb') as f:
-                    pickle.dump(normalizer, f)
+                save_normalizer_cache(normalizer_path, normalizer, normalizer_signature)
 
         # load normalizer on all processes
         accelerator.wait_for_everyone()
-        normalizer = pickle.load(open(normalizer_path, 'rb'))
+        normalizer = load_normalizer_cache(normalizer_path, normalizer_signature)
+        if normalizer is None:
+            raise RuntimeError("normalizer cache was not published by the main process")
+        self.bind_checkpoint_artifacts(
+            normalizer_signature,
+            normalizer_path=normalizer_path,
+            role="LDP",
+        )
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()

@@ -219,6 +219,7 @@ def build_v2_manifest(
     *,
     arrays: dict[str, zarr.Array],
     pca_path: Path,
+    tactile_cache_paths: dict[str, Path],
     tactile_embedding_dim: int,
     episode_manifest: list[dict],
     repair_counts: dict[str, int],
@@ -252,6 +253,12 @@ def build_v2_manifest(
             for key, array in sorted(arrays.items())
         },
         "pca_sha256": sha256_file(Path(pca_path)),
+        "tactile_cache_sha256": stable_json_sha256(
+            {
+                dataset_name: sha256_file(Path(cache_path))
+                for dataset_name, cache_path in sorted(tactile_cache_paths.items())
+            }
+        ),
         "pca_output_dim": int(tactile_embedding_dim),
         "pca_sensor_to_arm_order": ["left", "right"],
         "source_episodes": episode_manifest,
@@ -327,6 +334,13 @@ def main() -> None:
         dataset_name: np.zeros(2, dtype=np.int64) for dataset_name in args.datasets
     }
     source_valid_counts = {dataset_name: 0 for dataset_name in args.datasets}
+    tactile_cache_paths = {
+        dataset_name: args.tactile_cache_root
+        / "KaiyueChen"
+        / dataset_name
+        / "embeddings.npy"
+        for dataset_name in args.datasets
+    }
     total_frames = 0
 
     progress = tqdm(
@@ -340,7 +354,7 @@ def main() -> None:
     for dataset_id, dataset_name in enumerate(args.datasets):
         dataset_dir = args.dataset_root / dataset_name
         records, offsets = load_episode_lengths(dataset_dir)
-        cache_path = args.tactile_cache_root / "KaiyueChen" / dataset_name / "embeddings.npy"
+        cache_path = tactile_cache_paths[dataset_name]
         tactile_cache = np.load(cache_path, mmap_mode="r", allow_pickle=False)
         if tactile_cache.ndim != 3 or tactile_cache.shape[1:] != (4, 512):
             raise ValueError(f"{cache_path}: expected [N,4,512], got {tactile_cache.shape}")
@@ -446,6 +460,7 @@ def main() -> None:
     manifest = build_v2_manifest(
         arrays=arrays,
         pca_path=args.tactile_pca_path,
+        tactile_cache_paths=tactile_cache_paths,
         tactile_embedding_dim=tactile_embedding_dim,
         episode_manifest=episode_manifest,
         repair_counts=repair_counts,

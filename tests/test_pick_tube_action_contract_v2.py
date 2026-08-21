@@ -118,6 +118,8 @@ def test_converter_v2_schema_and_manifest_are_json_serializable(tmp_path):
     zarr_path = tmp_path / "replay_buffer.zarr"
     pca_path = tmp_path / "pca.npz"
     pca_path.write_bytes(b"stable-pca")
+    tactile_cache_path = tmp_path / "embeddings.npy"
+    tactile_cache_path.write_bytes(b"stable-tactile-cache")
     root, arrays = create_output(zarr_path, tactile_embedding_dim=30)
 
     assert arrays["action_raw"].shape == (0, 20)
@@ -133,6 +135,7 @@ def test_converter_v2_schema_and_manifest_are_json_serializable(tmp_path):
     manifest = build_v2_manifest(
         arrays=arrays,
         pca_path=pca_path,
+        tactile_cache_paths={"pick_tube_01": tactile_cache_path},
         tactile_embedding_dim=30,
         episode_manifest=episode_manifest,
         repair_counts={"terminal_actions": 1, "invalid_nonterminal_actions": 0},
@@ -147,6 +150,7 @@ def test_converter_v2_schema_and_manifest_are_json_serializable(tmp_path):
     assert manifest["repair_counts"]["terminal_actions"] == 1
     assert manifest["arrays"]["action"]["shape"] == [0, 20]
     assert len(manifest["pca_sha256"]) == 64
+    assert len(manifest["tactile_cache_sha256"]) == 64
     assert len(manifest["dataset_digest"]) == 64
     json.loads(root["meta"].attrs["v2_manifest_json"])
 

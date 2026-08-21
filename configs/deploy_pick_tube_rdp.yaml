@@ -5,6 +5,7 @@ model:
   at_checkpoint: /home/typhon/RDP_vitamin/data/weights/wjstx_rdp/tactile/rdp/60/at/latest.ckpt
   tactile_encoder_dir: data/encoder_ckpt_0809
   tactile_pca_path: /home/typhon/RDP_vitamin/data/weights/wjstx_rdp/tactile/rdp/tactile_pca_armwise_01_02_03_04_05_06_2x30.npz
+  artifact_verification: strict
   device: cuda:0
   num_inference_steps: 8
 

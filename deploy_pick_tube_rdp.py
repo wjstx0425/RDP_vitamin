@@ -7,6 +7,7 @@ import argparse
 import copy
 import os
 import time
+import warnings
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ from omegaconf import OmegaConf
 from reactive_diffusion_policy.deploy.bridge_client import RobotBridgeClient
 from reactive_diffusion_policy.deploy.tactile_encoder_torch import load_tactile_resnet18
 from reactive_diffusion_policy.model.tactile_pca import BimanualTactilePCA
+from reactive_diffusion_policy.common.artifact_manifest import (
+    ArtifactManifest,
+    sha256_file,
+)
 
 
 CAMERA_KEYS = ("observation.images.camera0", "observation.images.camera1")
@@ -164,12 +169,71 @@ def validate_tactile_dimensions(
         )
 
 
+def validate_artifact_pairing(
+    ldp_cfg: Any,
+    at_cfg: Any,
+    at_checkpoint: Path,
+    *,
+    artifact_verification: str,
+    tactile_pca_path: Path | None = None,
+) -> None:
+    """Reject identity-mismatched v2 bundles before policy construction."""
+    if artifact_verification not in {"strict", "legacy-compatible"}:
+        raise ValueError(
+            "artifact_verification must be 'strict' or 'legacy-compatible'"
+        )
+    ldp_value = OmegaConf.select(ldp_cfg, "artifacts")
+    at_value = OmegaConf.select(at_cfg, "artifacts")
+    if (ldp_value is None) != (at_value is None):
+        missing_role = "LDP" if ldp_value is None else "AT"
+        raise ValueError(
+            f"{missing_role} checkpoint is missing artifacts metadata; "
+            "v1/v2 checkpoint mixing is not supported"
+        )
+    if ldp_value is None:
+        if artifact_verification == "strict":
+            raise ValueError("LDP checkpoint is missing artifacts metadata in strict mode")
+        warnings.warn(
+            "Loading legacy checkpoints without artifact identity verification",
+            UserWarning,
+            stacklevel=2,
+        )
+        return
+
+    ldp_manifest = ArtifactManifest.from_dict(ldp_value, role="LDP")
+    at_manifest = ArtifactManifest.from_dict(at_value, role="AT")
+    shared_fields = (
+        ("dataset_digest", "dataset"),
+        ("split_digest", "dataset split"),
+        ("action_representation_version", "action representation"),
+        ("action_contract", "action contract"),
+        ("normalizer_version", "normalizer version"),
+        ("pca_sha256", "PCA"),
+        ("tactile_cache_sha256", "tactile cache"),
+    )
+    for field, label in shared_fields:
+        if getattr(ldp_manifest, field) != getattr(at_manifest, field):
+            raise ValueError(f"LDP and AT {label} artifact identities do not match")
+
+    actual_at_sha256 = sha256_file(Path(at_checkpoint))
+    if ldp_manifest.at_sha256 != actual_at_sha256:
+        raise ValueError("LDP expected a different AT checkpoint artifact")
+    if not ldp_manifest.latent_target_mode.startswith("posterior_mode_"):
+        raise ValueError("LDP latent target mode is not deterministic")
+    if tactile_pca_path is not None:
+        actual_pca_sha256 = sha256_file(Path(tactile_pca_path))
+        if ldp_manifest.pca_sha256 != actual_pca_sha256:
+            raise ValueError("Configured PCA artifact does not match checkpoint metadata")
+
+
 def load_policy(
     ldp_checkpoint: Path,
     at_checkpoint: Path,
     device: torch.device,
     num_inference_steps: int,
     tactile_embedding_dim: int,
+    artifact_verification: str = "strict",
+    tactile_pca_path: Path | None = None,
 ):
     payload = _load_checkpoint_payload(ldp_checkpoint, "LDP")
     at_payload = _load_checkpoint_payload(at_checkpoint, "AT")
@@ -182,6 +246,13 @@ def load_policy(
         at_cfg,
         ldp_checkpoint,
         at_checkpoint,
+    )
+    validate_artifact_pairing(
+        cfg,
+        at_cfg,
+        at_checkpoint,
+        artifact_verification=artifact_verification,
+        tactile_pca_path=tactile_pca_path,
     )
     cfg.at_load_dir = str(at_checkpoint)
     cfg.policy.at.load_dir = str(at_checkpoint)
@@ -382,6 +453,8 @@ def run(config_path: Path, device_override: str | None = None) -> None:
         device,
         int(model_config.get("num_inference_steps", 8)),
         tactile_pca.output_dim,
+        artifact_verification=str(model_config.get("artifact_verification", "strict")),
+        tactile_pca_path=tactile_pca_path,
     )
     tactile_encoder = load_tactile_resnet18(encoder_dir, device=device)
     rdp = PickTubeRDPRuntime(

@@ -7,6 +7,11 @@ import dill
 import torch
 import threading
 
+from reactive_diffusion_policy.common.artifact_manifest import (
+    ArtifactManifest,
+    sha256_file,
+)
+
 
 class BaseWorkspace:
     include_keys = tuple()
@@ -61,6 +66,22 @@ class BaseWorkspace:
         """
         pass
 
+    def bind_checkpoint_artifacts(self, signature, *, normalizer_path, role):
+        """Bind the training inputs that this checkpoint is safe to use with."""
+        manifest = ArtifactManifest.from_cache_signature(
+            signature,
+            normalizer_sha256=sha256_file(pathlib.Path(normalizer_path)),
+            role=role,
+        )
+        OmegaConf.update(
+            self.cfg,
+            "artifacts",
+            manifest.to_dict(),
+            merge=False,
+            force_add=True,
+        )
+        return manifest
+
     def save_checkpoint(self, path=None, tag='latest', 
             exclude_keys=None,
             include_keys=None,
@@ -73,6 +94,11 @@ class BaseWorkspace:
             exclude_keys = tuple(self.exclude_keys)
         if include_keys is None:
             include_keys = tuple(self.include_keys) + ('_output_dir',)
+
+        artifacts = OmegaConf.select(self.cfg, "artifacts")
+        if artifacts is not None:
+            role = "LDP" if OmegaConf.select(self.cfg, "artifacts.at_sha256") else "AT"
+            ArtifactManifest.from_dict(artifacts, role=role)
 
         path.parent.mkdir(parents=False, exist_ok=True)
         payload = {
