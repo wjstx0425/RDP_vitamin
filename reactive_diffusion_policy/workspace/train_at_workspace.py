@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import math
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -29,8 +30,19 @@ from reactive_diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+
+def should_optimizer_step(batch_idx, num_batches, accumulate_every):
+    accumulate_every = int(accumulate_every)
+    if accumulate_every < 1:
+        raise ValueError("accumulate_every must be positive")
+    return (
+        (int(batch_idx) + 1) % accumulate_every == 0
+        or int(batch_idx) + 1 == int(num_batches)
+    )
+
+
 class TrainATWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'optimizer_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -50,6 +62,7 @@ class TrainATWorkspace(BaseWorkspace):
             cfg.optimizer, params=self.model.optim_params)
 
         self.global_step = 0
+        self.optimizer_step = 0
         self.epoch = 0
 
     def run(self):
@@ -57,11 +70,13 @@ class TrainATWorkspace(BaseWorkspace):
 
         # resume training
         resumed = False
+        resumed_optimizer_step = False
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+                payload = self.load_checkpoint(path=lastest_ckpt_path)
+                resumed_optimizer_step = "optimizer_step" in payload.get("pickles", {})
                 self.advance_training_state_for_resume()
                 resumed = True
                 print(
@@ -75,6 +90,10 @@ class TrainATWorkspace(BaseWorkspace):
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
+        if resumed and not resumed_optimizer_step:
+            self.optimizer_step = self.epoch * math.ceil(
+                len(train_dataloader) / cfg.training.gradient_accumulate_every
+            )
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
@@ -88,11 +107,15 @@ class TrainATWorkspace(BaseWorkspace):
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
+                math.ceil(
+                    len(train_dataloader)
+                    / cfg.training.gradient_accumulate_every
+                )
+                * cfg.training.num_epochs
+            ),
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step - 1
+            last_epoch=self.optimizer_step - 1
         )
 
         # configure logging
@@ -129,6 +152,13 @@ class TrainATWorkspace(BaseWorkspace):
             cfg.training.checkpoint_every = 1
             cfg.training.val_every = 1
 
+        num_train_batches = len(train_dataloader)
+        if cfg.training.max_train_steps is not None:
+            num_train_batches = min(
+                num_train_batches,
+                cfg.training.max_train_steps,
+            )
+
         num_epochs_to_run = self.get_remaining_epochs(cfg.training.num_epochs)
         if resumed:
             print(
@@ -154,14 +184,26 @@ class TrainATWorkspace(BaseWorkspace):
                         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
                             loss_metric_dict = self.model.compute_loss_and_metric(batch)
                         raw_loss = loss_metric_dict["loss"]
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        group_start = (
+                            batch_idx // cfg.training.gradient_accumulate_every
+                        ) * cfg.training.gradient_accumulate_every
+                        group_size = min(
+                            cfg.training.gradient_accumulate_every,
+                            num_train_batches - group_start,
+                        )
+                        loss = raw_loss / group_size
                         loss.backward()
 
                         # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        if should_optimizer_step(
+                            batch_idx,
+                            num_train_batches,
+                            cfg.training.gradient_accumulate_every,
+                        ):
                             self.optimizer.step()
-                            self.optimizer.zero_grad()
                             lr_scheduler.step()
+                            self.optimizer.zero_grad()
+                            self.optimizer_step += 1
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -197,7 +239,7 @@ class TrainATWorkspace(BaseWorkspace):
                                 'train_kl_loss': kl_loss
                             })
 
-                        is_last_batch = (batch_idx == (len(train_dataloader) - 1))
+                        is_last_batch = batch_idx == num_train_batches - 1
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             wandb_run.log(step_log, step=self.global_step)

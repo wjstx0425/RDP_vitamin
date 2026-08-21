@@ -75,8 +75,40 @@ class LatentDiffusionUnetImagePolicy(DiffusionUnetImagePolicy):
                 module_list[-1] = nn.Identity()
 
         self.at = at
-        self.at.eval()
         self.use_latent_action_before_vq = use_latent_action_before_vq
+        self.freeze_action_tokenizer()
+
+    def freeze_action_tokenizer(self):
+        self.at.requires_grad_(False)
+        self.at.eval()
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.at.eval()
+        return self
+
+    def encode_latent_target(self, nactions):
+        with torch.inference_mode():
+            nlatent_actions = self.at.encoder(
+                self.at.preprocess(nactions / self.at.act_scale)
+            )
+            if self.at.use_vq:
+                if not self.use_latent_action_before_vq:
+                    nlatent_actions, _, _ = self.at.quant_state_with_vq(
+                        nlatent_actions
+                    )
+                elif self.at.use_conv_encoder:
+                    nlatent_actions = einops.rearrange(
+                        nlatent_actions,
+                        'N T A -> N (T A)',
+                    )
+            else:
+                nlatent_actions, _ = self.at.quant_state_without_vq(
+                    nlatent_actions,
+                    sample=False,
+                )
+        return nlatent_actions.detach().clone()
 
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
@@ -218,18 +250,7 @@ class LatentDiffusionUnetImagePolicy(DiffusionUnetImagePolicy):
 
         # get latent action
         batch_size = nactions.shape[0]
-        nlatent_actions = self.at.encoder(
-            self.at.preprocess(nactions / self.at.act_scale)
-        )
-        # note: handle latent action correctly
-        if self.at.use_vq:
-            if not self.use_latent_action_before_vq:
-                nlatent_actions, _, _ = self.at.quant_state_with_vq(nlatent_actions)
-            else:
-                if self.at.use_conv_encoder:
-                    nlatent_actions = einops.rearrange(nlatent_actions, 'N T A -> N (T A)')
-        else:
-            nlatent_actions, _ = self.at.quant_state_without_vq(nlatent_actions)
+        nlatent_actions = self.encode_latent_target(nactions)
         nlatent_actions = einops.rearrange(nlatent_actions, 'N (T A) -> N T A', T=self.horizon)
         nlatent_actions = self.normalizer['latent_action'].normalize(nlatent_actions)
 

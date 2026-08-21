@@ -277,7 +277,7 @@ class VAE:
 
         return state_vq, vq_code, vq_loss_state
 
-    def quant_state_without_vq(self, state):
+    def quant_state_without_vq(self, state, *, sample: bool = True):
         batch_size = state.size(0)
         if len(state.shape) == 2:
             state = einops.rearrange(state, "N (T A) -> N A T", T=self.downsampled_input_h)
@@ -286,7 +286,7 @@ class VAE:
 
         moments = self.quant(state)
         posterior = DiagonalGaussianDistribution(moments)
-        state_vq = posterior.sample()
+        state_vq = posterior.sample() if sample else posterior.mode()
         state_vq = einops.rearrange(state_vq, "N A T -> N (T A)")
 
         return state_vq, posterior
@@ -384,6 +384,20 @@ class VAE:
 
         return return_dict
 
+    def parameters(self):
+        modules = [self.encoder, self.decoder]
+        if self.use_vq:
+            modules.append(self.vq_layer)
+        else:
+            modules.extend([self.quant, self.post_quant])
+        for module in modules:
+            yield from module.parameters()
+
+    def requires_grad_(self, requires_grad=True):
+        for parameter in self.parameters():
+            parameter.requires_grad_(requires_grad)
+        return self
+
     def eval(self):
         self.encoder.eval()
         self.decoder.eval()
@@ -392,6 +406,7 @@ class VAE:
         else:
             self.quant.eval()
             self.post_quant.eval()
+        return self
 
     def train(self):
         self.encoder.train()
@@ -401,6 +416,7 @@ class VAE:
         else:
             self.quant.train()
             self.post_quant.train()
+        return self
 
     def to(self, device):
         self.encoder.to(device)

@@ -53,7 +53,10 @@ class RealImageTactileLatentDiffusionDataset(RealImageTactileDataset):
                 if not self.use_latent_action_before_vq:
                     latent_action, _, _ = self.at.quant_state_with_vq(latent_action)
             else:
-                latent_action, _ = self.at.quant_state_without_vq(latent_action)
+                latent_action, _ = self.at.quant_state_without_vq(
+                    latent_action,
+                    sample=False,
+                )
             if self.at.use_conv_encoder:
                 latent_action = einops.rearrange(latent_action, "N (T A) -> N T A", T=self.at.downsampled_input_h)
             else:

@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import math
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -31,11 +32,12 @@ from reactive_diffusion_policy.model.common.lr_scheduler import get_scheduler
 from reactive_diffusion_policy.model.common.lr_decay import param_groups_lrd
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+from reactive_diffusion_policy.workspace.train_at_workspace import should_optimizer_step
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'optimizer_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -113,6 +115,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         # configure training state
         self.global_step = 0
+        self.optimizer_step = 0
         self.epoch = 0
 
     def run(self):
@@ -132,11 +135,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
         # resume training
         resumed = False
+        resumed_optimizer_step = False
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+                payload = self.load_checkpoint(path=lastest_ckpt_path)
+                resumed_optimizer_step = "optimizer_step" in payload.get("pickles", {})
                 self.advance_training_state_for_resume()
                 resumed = True
                 accelerator.print(
@@ -149,6 +154,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        if resumed and not resumed_optimizer_step:
+            self.optimizer_step = self.epoch * math.ceil(
+                len(train_dataloader) / cfg.training.gradient_accumulate_every
+            )
         
         # normalizer = dataset.get_normalizer()
         # compute normalizer on the main process and save to disk
@@ -179,11 +188,15 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
+                math.ceil(
+                    len(train_dataloader)
+                    / cfg.training.gradient_accumulate_every
+                )
+                * cfg.training.num_epochs
+            ),
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            last_epoch=self.optimizer_step - 1
         )
 
         # configure ema
@@ -195,7 +208,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if resumed:
                 # Continue EMA warmup from the restored training position.
                 # Otherwise the first update overwrites the restored EMA.
-                ema.optimization_step = self.global_step
+                ema.optimization_step = self.optimizer_step
 
         # configure logging
         # wandb_run = wandb.init(
@@ -237,6 +250,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
 
+        num_train_batches = len(train_dataloader)
+        if cfg.training.max_train_steps is not None:
+            num_train_batches = min(
+                num_train_batches,
+                cfg.training.max_train_steps,
+            )
+
         num_epochs_to_run = self.get_remaining_epochs(cfg.training.num_epochs)
         if resumed:
             accelerator.print(
@@ -266,18 +286,28 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
                         # compute loss
                         raw_loss = self.model(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        group_start = (
+                            batch_idx // cfg.training.gradient_accumulate_every
+                        ) * cfg.training.gradient_accumulate_every
+                        group_size = min(
+                            cfg.training.gradient_accumulate_every,
+                            num_train_batches - group_start,
+                        )
+                        loss = raw_loss / group_size
                         accelerator.backward(loss)
 
                         # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        if should_optimizer_step(
+                            batch_idx,
+                            num_train_batches,
+                            cfg.training.gradient_accumulate_every,
+                        ):
                             self.optimizer.step()
-                            self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
-                        # update ema
-                        if cfg.training.use_ema:
-                            ema.step(accelerator.unwrap_model(self.model))
+                            if cfg.training.use_ema:
+                                ema.step(accelerator.unwrap_model(self.model))
+                            self.optimizer.zero_grad()
+                            self.optimizer_step += 1
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -290,7 +320,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             'lr': lr_scheduler.get_last_lr()[0]
                         }
 
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                        is_last_batch = batch_idx == num_train_batches - 1
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
