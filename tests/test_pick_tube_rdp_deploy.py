@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 from omegaconf import OmegaConf
@@ -27,7 +28,8 @@ class FakeTactileEncoder(nn.Module):
 
 
 class FakePolicy:
-    def __init__(self) -> None:
+    def __init__(self, components_per_arm: int) -> None:
+        self.components_per_arm = components_per_arm
         self.slow_calls = 0
         self.fast_history_lengths = []
         self.slow_observation_states = []
@@ -36,14 +38,15 @@ class FakePolicy:
         assert tuple(obs_dict["camera1"].shape) == (1, 2, 3, 224, 224)
         assert tuple(obs_dict["camera2"].shape) == (1, 2, 3, 224, 224)
         assert tuple(obs_dict["observation_state"].shape) == (1, 2, 20)
-        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, 30)
+        tactile_dim = self.components_per_arm * 2
+        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, tactile_dim)
         torch.testing.assert_close(
-            obs_dict["tactile_embedding"][0, :, :15],
-            torch.full((2, 15), 1.0 / 255.0),
+            obs_dict["tactile_embedding"][0, :, : self.components_per_arm],
+            torch.full((2, self.components_per_arm), 1.0 / 255.0),
         )
         torch.testing.assert_close(
-            obs_dict["tactile_embedding"][0, :, 15:],
-            torch.full((2, 15), 3.0 / 255.0),
+            obs_dict["tactile_embedding"][0, :, self.components_per_arm :],
+            torch.full((2, self.components_per_arm), 3.0 / 255.0),
         )
         assert kwargs["return_latent_action"] is True
         self.slow_observation_states.append(
@@ -62,6 +65,7 @@ class FakePolicy:
         assert tuple(latent_action.shape) == (1, 128)
         assert dataset_obs_temporal_downsample_ratio == 2
         history_length = extended_obs["tactile_embedding"].shape[1]
+        assert extended_obs["tactile_embedding"].shape[2] == self.components_per_arm * 2
         assert extended_obs_last_step == history_length
         self.fast_history_lengths.append(history_length)
         return {"action": torch.full((1, history_length, 20), float(history_length))}
@@ -76,6 +80,21 @@ def observation(step: int = 0) -> dict:
     for value, key in enumerate(deploy.TACTILE_KEYS, start=1):
         result[key] = np.full((224, 224, 3), value, dtype=np.uint8)
     return result
+
+
+def tactile_cfg(obs_dim: int, extended_dim: int | None = None):
+    return OmegaConf.create(
+        {
+            "shape_meta": {
+                "obs": {"tactile_embedding": {"shape": [obs_dim]}},
+                "extended_obs": {
+                    "tactile_embedding": {
+                        "shape": [obs_dim if extended_dim is None else extended_dim]
+                    }
+                },
+            }
+        }
+    )
 
 
 def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
@@ -106,12 +125,51 @@ def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
     ) == [{"type": "RandomCrop", "ratio": 0.9}]
 
 
-def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step() -> None:
-    policy = FakePolicy()
+@pytest.mark.parametrize("tactile_dim", [16, 30, 60])
+def test_validate_tactile_dimensions_accepts_matching_artifacts(
+    tactile_dim: int,
+) -> None:
+    deploy.validate_tactile_dimensions(
+        tactile_dim,
+        tactile_cfg(tactile_dim),
+        tactile_cfg(tactile_dim),
+        Path("ldp.ckpt"),
+        Path("at.ckpt"),
+    )
+
+
+def test_validate_tactile_dimensions_reports_every_source() -> None:
+    with pytest.raises(ValueError) as error:
+        deploy.validate_tactile_dimensions(
+            16,
+            tactile_cfg(16, extended_dim=30),
+            tactile_cfg(60),
+            Path("ldp.ckpt"),
+            Path("at.ckpt"),
+        )
+
+    message = str(error.value)
+    assert "PCA output=16D" in message
+    assert "LDP obs (ldp.ckpt)=16D" in message
+    assert "LDP extended_obs (ldp.ckpt)=30D" in message
+    assert "AT obs (at.ckpt)=60D" in message
+    assert "AT extended_obs (at.ckpt)=60D" in message
+
+
+def test_tactile_dim_reports_missing_checkpoint_field() -> None:
+    with pytest.raises(ValueError, match="LDP checkpoint is missing"):
+        deploy._tactile_dim(OmegaConf.create({}), "LDP", "obs")
+
+
+@pytest.mark.parametrize("components_per_arm", [8, 15, 30])
+def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step(
+    components_per_arm: int,
+) -> None:
+    policy = FakePolicy(components_per_arm)
     encoder = FakeTactileEncoder()
     means = np.zeros((2, 1024), dtype=np.float32)
-    components = np.zeros((2, 15, 1024), dtype=np.float32)
-    components[:, np.arange(15), np.arange(15)] = 1.0
+    components = np.zeros((2, components_per_arm, 1024), dtype=np.float32)
+    components[:, np.arange(components_per_arm), np.arange(components_per_arm)] = 1.0
     tactile_pca = deploy.BimanualTactilePCA(means, components)
     runtime = deploy.PickTubeRDPRuntime(
         policy,
