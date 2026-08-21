@@ -114,6 +114,7 @@ class SequenceSampler:
         key_first_k=dict(),
         episode_mask: Optional[np.ndarray]=None,
         episode_repeats: Optional[np.ndarray]=None,
+        canonical_action_padding: bool=False,
         ):
         """
         key_first_k: dict str: int
@@ -157,6 +158,7 @@ class SequenceSampler:
         self.sequence_length = sequence_length
         self.replay_buffer = replay_buffer
         self.key_first_k = key_first_k
+        self.canonical_action_padding = bool(canonical_action_padding)
     
     def __len__(self):
         return len(self.indices)
@@ -192,7 +194,7 @@ class SequenceSampler:
                     if key not in ("action_valid", "idle_arm_mask"):
                         data[:sample_start_idx] = sample[0]
                 if sample_end_idx < self.sequence_length:
-                    if key == "action":
+                    if key == "action" and self.canonical_action_padding:
                         data[sample_end_idx:] = _canonical_action_suffix_value(sample[-1])
                     elif key not in ("action_valid", "idle_arm_mask"):
                         data[sample_end_idx:] = sample[-1]

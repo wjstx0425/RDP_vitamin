@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import zarr
 from numcodecs import Blosc
@@ -144,6 +145,45 @@ def append(array: zarr.Array, values: np.ndarray) -> None:
     old_length = array.shape[0]
     array.resize((old_length + values.shape[0],) + array.shape[1:])
     array[old_length:] = values
+
+
+def extract_float32_matrix(
+    column: pa.ChunkedArray, *, expected_width: int, name: str
+) -> np.ndarray:
+    """Extract a list-valued Arrow column without casting its physical values."""
+    column_type = column.type
+    if pa.types.is_fixed_size_list(column_type):
+        if column_type.list_size != expected_width:
+            raise ValueError(
+                f"{name} must have width {expected_width}, got {column_type.list_size}"
+            )
+    elif not (pa.types.is_list(column_type) or pa.types.is_large_list(column_type)):
+        raise ValueError(f"{name} must be an Arrow list column, got {column_type}")
+
+    if not pa.types.is_float32(column_type.value_type):
+        raise ValueError(
+            f"{name} must contain float32 values, got {column_type.value_type}"
+        )
+    if column.null_count:
+        raise ValueError(f"{name} must not contain null rows")
+
+    matrices = []
+    for chunk in column.chunks:
+        if not pa.types.is_fixed_size_list(column_type):
+            lengths = np.diff(chunk.offsets.to_numpy(zero_copy_only=False))
+            if not np.all(lengths == expected_width):
+                raise ValueError(f"{name} rows must all have width {expected_width}")
+        flat = chunk.flatten()
+        if flat.null_count:
+            raise ValueError(f"{name} must not contain null values")
+        values = flat.to_numpy(zero_copy_only=False)
+        if values.dtype != np.float32:
+            raise ValueError(f"{name} extraction changed dtype to {values.dtype}")
+        matrices.append(values.reshape(len(chunk), expected_width))
+
+    if not matrices:
+        return np.empty((0, expected_width), dtype=np.float32)
+    return np.concatenate(matrices, axis=0)
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -319,7 +359,9 @@ def main() -> None:
             camera1 = np.stack([decode_image(value, dataset_dir) for value in table[CAMERA_KEYS[0]].to_pylist()])
             camera2 = np.stack([decode_image(value, dataset_dir) for value in table[CAMERA_KEYS[1]].to_pylist()])
             state = np.asarray(table[STATE_KEY].to_pylist(), dtype=np.float32)
-            action = np.asarray(table[ACTION_KEY].to_pylist(), dtype=np.float32)
+            action = extract_float32_matrix(
+                table[ACTION_KEY], expected_width=20, name=ACTION_KEY
+            )
             start = offsets[episode_index]
             tactile_raw = np.asarray(
                 tactile_cache[start : start + expected_length], dtype=np.float32

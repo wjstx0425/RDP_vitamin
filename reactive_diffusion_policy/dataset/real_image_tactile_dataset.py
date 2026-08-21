@@ -144,7 +144,8 @@ class RealImageTactileDataset(BaseImageDataset):
             pad_after=pad_after,
             episode_mask=train_mask,
             episode_repeats=episode_repeats,
-            key_first_k=key_first_k)
+            key_first_k=key_first_k,
+            canonical_action_padding=has_v2_action_contract)
         
         self.replay_buffer = replay_buffer
         self.sampler = sampler
@@ -175,6 +176,7 @@ class RealImageTactileDataset(BaseImageDataset):
             # not apply episode_repeats because oversampling is a training-only
             # weighting, but it should still avoid reading unused RGB frames.
             key_first_k=self.key_first_k,
+            canonical_action_padding=getattr(self, "has_v2_action_contract", False),
             )
         val_set.val_mask = ~self.val_mask
         return val_set

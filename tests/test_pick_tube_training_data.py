@@ -63,6 +63,7 @@ def test_sequence_sampler_uses_canonical_noop_for_action_suffix():
         replay_buffer=replay_buffer,
         sequence_length=4,
         pad_after=2,
+        canonical_action_padding=True,
     )
 
     sample = sampler.sample_sequence(0)
@@ -80,6 +81,21 @@ def test_sequence_sampler_uses_canonical_noop_for_action_suffix():
     assert not sample["action_valid"][2:].any()
     assert not sample["idle_arm_mask"][2:].any()
     np.testing.assert_array_equal(sample["value"][2:], [[1], [1]])
+
+
+def test_sequence_sampler_legacy_20d_action_padding_repeats_last_action():
+    replay_buffer = ReplayBuffer.create_empty_numpy()
+    action = np.arange(40, dtype=np.float32).reshape(2, 20)
+    replay_buffer.add_episode({"action": action})
+    sampler = SequenceSampler(
+        replay_buffer=replay_buffer,
+        sequence_length=4,
+        pad_after=2,
+    )
+
+    sample = sampler.sample_sequence(0)
+
+    np.testing.assert_array_equal(sample["action"][2:], np.tile(action[-1], (2, 1)))
 
 
 def _write_minimal_action_dataset(path, include_v2_arrays):
@@ -111,8 +127,10 @@ def test_dataset_exposes_v2_masks_at_top_level(tmp_path):
     dataset_path = tmp_path / "v2"
     _write_minimal_action_dataset(dataset_path, include_v2_arrays=True)
 
-    sample = _minimal_dataset(dataset_path)[0]
+    dataset = _minimal_dataset(dataset_path)
+    sample = dataset[0]
 
+    assert dataset.sampler.canonical_action_padding is True
     assert sample["valid_mask"].dtype == torch.bool
     assert sample["idle_arm_mask"].dtype == torch.bool
     torch.testing.assert_close(sample["valid_mask"], torch.tensor([True, False]))
@@ -128,7 +146,9 @@ def test_dataset_requires_explicit_legacy_action_contract_opt_in(tmp_path):
     with pytest.raises(ValueError, match="allow_legacy_action_contract"):
         _minimal_dataset(dataset_path)
 
-    sample = _minimal_dataset(dataset_path, allow_legacy_action_contract=True)[0]
+    dataset = _minimal_dataset(dataset_path, allow_legacy_action_contract=True)
+    sample = dataset[0]
+    assert dataset.sampler.canonical_action_padding is False
     torch.testing.assert_close(sample["valid_mask"], torch.ones(2, dtype=torch.bool))
     torch.testing.assert_close(sample["idle_arm_mask"], torch.zeros((2, 2), dtype=torch.bool))
 

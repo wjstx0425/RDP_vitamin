@@ -1,9 +1,14 @@
 import json
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
-from convert_pick_tube_lerobot_to_rdp_zarr import build_v2_manifest, create_output
+from convert_pick_tube_lerobot_to_rdp_zarr import (
+    build_v2_manifest,
+    create_output,
+    extract_float32_matrix,
+)
 from reactive_diffusion_policy.common.pick_tube_action_contract import (
     ACTION_CONTRACT,
     ACTION_REPRESENTATION_VERSION,
@@ -144,3 +149,27 @@ def test_converter_v2_schema_and_manifest_are_json_serializable(tmp_path):
     assert len(manifest["pca_sha256"]) == 64
     assert len(manifest["dataset_digest"]) == 64
     json.loads(root["meta"].attrs["v2_manifest_json"])
+
+
+def test_converter_extracts_float32_actions_without_value_coercion():
+    expected = np.array(
+        [[0.1, -0.2, 0.3], [np.nextafter(np.float32(1), np.float32(2)), 0.0, -0.0]],
+        dtype=np.float32,
+    )
+    column = pa.chunked_array(
+        [pa.array(expected.tolist(), type=pa.list_(pa.float32(), 3))]
+    )
+
+    actual = extract_float32_matrix(column, expected_width=3, name="actions")
+
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_converter_rejects_non_float32_action_schema():
+    column = pa.chunked_array(
+        [pa.array([[0.1, 0.2, 0.3]], type=pa.list_(pa.float64(), 3))]
+    )
+
+    with pytest.raises(ValueError, match="float32 values"):
+        extract_float32_matrix(column, expected_width=3, name="actions")
