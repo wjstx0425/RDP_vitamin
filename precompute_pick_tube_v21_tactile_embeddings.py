@@ -25,6 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("pick_tube_tactile_cache_0809.yaml"))
     parser.add_argument("--dataset-root", type=Path)
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        help=(
+            "Dataset names or repo IDs to process. When provided, --dataset-root "
+            "must point to the directory containing their local folders. Bare "
+            "names are interpreted as KaiyueChen/<name>."
+        ),
+    )
     parser.add_argument("--cache-root", type=Path)
     parser.add_argument("--encoder-path", type=Path)
     parser.add_argument("--batch-size", type=int)
@@ -54,6 +63,16 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     cache_config = config["tactile_embedding_cache"]
     model_config = config["model"]
+    if args.datasets is not None:
+        if args.dataset_root is None:
+            raise ValueError("--dataset-root is required when --datasets is provided")
+        config["datasets"] = [
+            {
+                "repo_id": value if "/" in value else f"KaiyueChen/{value}",
+                "root": str(args.dataset_root / value.rsplit("/", 1)[-1]),
+            }
+            for value in args.datasets
+        ]
     if args.dataset_root is not None:
         for source in config["datasets"]:
             source["root"] = str(args.dataset_root / str(source["repo_id"]).rsplit("/", 1)[-1])
