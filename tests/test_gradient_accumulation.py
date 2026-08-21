@@ -100,6 +100,55 @@ def test_workspaces_use_effective_scheduler_step_count(workspace_class):
     assert "num_training_steps=get_num_training_steps(" in source
 
 
+@pytest.mark.parametrize(
+    (
+        "num_batches",
+        "max_train_steps",
+        "accumulate_every",
+        "completed_epochs",
+        "expected",
+    ),
+    [
+        (7, None, 3, 4, 12),
+        (7, 5, 3, 4, 8),
+        (7, 5, 2, 3, 9),
+    ],
+)
+def test_legacy_resume_optimizer_step_uses_effective_capped_batches(
+    num_batches,
+    max_train_steps,
+    accumulate_every,
+    completed_epochs,
+    expected,
+):
+    assert train_at_workspace.get_legacy_optimizer_step(
+        completed_epochs=completed_epochs,
+        num_batches=num_batches,
+        max_train_steps=max_train_steps,
+        accumulate_every=accumulate_every,
+    ) == expected
+
+
+def test_at_and_ldp_workspaces_share_legacy_optimizer_step_helper():
+    assert (
+        train_diffusion_unet_image_workspace.get_legacy_optimizer_step
+        is train_at_workspace.get_legacy_optimizer_step
+    )
+
+
+@pytest.mark.parametrize(
+    "workspace_class",
+    [
+        train_at_workspace.TrainATWorkspace,
+        train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace,
+    ],
+)
+def test_workspaces_use_effective_legacy_optimizer_step(workspace_class):
+    source = inspect.getsource(workspace_class.run)
+
+    assert "self.optimizer_step = get_legacy_optimizer_step(" in source
+
+
 def test_workspaces_persist_optimizer_step_separately_from_batch_logging_step():
     assert "global_step" in train_at_workspace.TrainATWorkspace.include_keys
     assert "optimizer_step" in train_at_workspace.TrainATWorkspace.include_keys

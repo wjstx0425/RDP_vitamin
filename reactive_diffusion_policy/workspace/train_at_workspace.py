@@ -64,6 +64,20 @@ def get_num_training_steps(
     return math.ceil(effective_batches / accumulate_every) * int(num_epochs)
 
 
+def get_legacy_optimizer_step(
+    completed_epochs,
+    num_batches,
+    max_train_steps,
+    accumulate_every,
+):
+    return get_num_training_steps(
+        num_batches=num_batches,
+        max_train_steps=max_train_steps,
+        accumulate_every=accumulate_every,
+        num_epochs=completed_epochs,
+    )
+
+
 class TrainATWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'optimizer_step', 'epoch']
 
@@ -121,8 +135,11 @@ class TrainATWorkspace(BaseWorkspace):
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
         if resumed and not resumed_optimizer_step:
-            self.optimizer_step = self.epoch * math.ceil(
-                len(train_dataloader) / cfg.training.gradient_accumulate_every
+            self.optimizer_step = get_legacy_optimizer_step(
+                completed_epochs=self.epoch,
+                num_batches=len(train_dataloader),
+                max_train_steps=cfg.training.max_train_steps,
+                accumulate_every=cfg.training.gradient_accumulate_every,
             )
 
         # configure validation dataset

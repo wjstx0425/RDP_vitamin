@@ -8,7 +8,6 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
-import math
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -34,6 +33,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from reactive_diffusion_policy.workspace.train_at_workspace import (
     get_effective_num_batches,
+    get_legacy_optimizer_step,
     get_num_training_steps,
     should_optimizer_step,
 )
@@ -168,8 +168,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         if resumed and not resumed_optimizer_step:
-            self.optimizer_step = self.epoch * math.ceil(
-                len(train_dataloader) / cfg.training.gradient_accumulate_every
+            self.optimizer_step = get_legacy_optimizer_step(
+                completed_epochs=self.epoch,
+                num_batches=len(train_dataloader),
+                max_train_steps=cfg.training.max_train_steps,
+                accumulate_every=cfg.training.gradient_accumulate_every,
             )
         
         # normalizer = dataset.get_normalizer()
