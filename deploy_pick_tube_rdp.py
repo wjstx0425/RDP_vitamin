@@ -7,6 +7,7 @@ import argparse
 import copy
 import os
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,114 @@ def prepare_inference_config(cfg: Any) -> None:
         cfg.policy.obs_encoder.random_transforms = [transforms[0]]
 
 
+def _load_checkpoint_payload(path: Path, role: str) -> Any:
+    try:
+        with path.open("rb") as file:
+            return torch.load(
+                file,
+                pickle_module=dill,
+                weights_only=False,
+                map_location="cpu",
+            )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to inspect {role} checkpoint {path}: {exc}") from exc
+
+
+def _checkpoint_cfg(payload: Any, role: str, checkpoint: Path) -> Any:
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"{role} checkpoint {checkpoint} payload must be a mapping containing cfg"
+        )
+    if "cfg" not in payload:
+        raise ValueError(f"{role} checkpoint {checkpoint} is missing cfg")
+    cfg = payload["cfg"]
+    if cfg is None:
+        raise ValueError(f"{role} checkpoint {checkpoint} has cfg=None")
+    if OmegaConf.is_dict(cfg):
+        return cfg
+    if isinstance(cfg, Mapping) and not OmegaConf.is_config(cfg):
+        try:
+            return OmegaConf.create(cfg)
+        except Exception as exc:
+            raise ValueError(
+                f"{role} checkpoint {checkpoint} cfg could not be normalized "
+                f"as mapping metadata: {exc}"
+            ) from exc
+    raise ValueError(
+        f"{role} checkpoint {checkpoint} cfg must be mapping metadata, "
+        f"got {type(cfg).__name__}"
+    )
+
+
+def _tactile_dim(
+    cfg: Any,
+    role: str,
+    field: str,
+    checkpoint: Path | None = None,
+) -> int:
+    key = f"shape_meta.{field}.tactile_embedding.shape"
+    checkpoint_label = f" checkpoint {checkpoint}" if checkpoint is not None else " checkpoint"
+    try:
+        shape = OmegaConf.select(cfg, key)
+    except Exception as exc:
+        raise ValueError(
+            f"{role}{checkpoint_label} could not resolve {key}: {exc}"
+        ) from exc
+    if (
+        not isinstance(shape, Sequence)
+        or isinstance(shape, (str, bytes))
+        or len(shape) != 1
+    ):
+        raise ValueError(f"{role}{checkpoint_label} is missing a valid {key}")
+    try:
+        dimension = shape[0]
+    except Exception as exc:
+        raise ValueError(
+            f"{role}{checkpoint_label} could not resolve {key}: {exc}"
+        ) from exc
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 1:
+        try:
+            invalid_shape = list(shape)
+        except Exception as exc:
+            raise ValueError(
+                f"{role}{checkpoint_label} could not resolve {key}: {exc}"
+            ) from exc
+        raise ValueError(
+            f"{role}{checkpoint_label} has invalid {key}: {invalid_shape}"
+        )
+    return dimension
+
+
+def validate_tactile_dimensions(
+    pca_dim: int,
+    ldp_cfg: Any,
+    at_cfg: Any,
+    ldp_checkpoint: Path,
+    at_checkpoint: Path,
+) -> None:
+    dimensions = {
+        "PCA output": pca_dim,
+        f"LDP obs ({ldp_checkpoint})": _tactile_dim(
+            ldp_cfg, "LDP", "obs", ldp_checkpoint
+        ),
+        f"LDP extended_obs ({ldp_checkpoint})": _tactile_dim(
+            ldp_cfg, "LDP", "extended_obs", ldp_checkpoint
+        ),
+        f"AT obs ({at_checkpoint})": _tactile_dim(at_cfg, "AT", "obs", at_checkpoint),
+        f"AT extended_obs ({at_checkpoint})": _tactile_dim(
+            at_cfg, "AT", "extended_obs", at_checkpoint
+        ),
+    }
+    if len(set(dimensions.values())) != 1:
+        details = ", ".join(
+            f"{source}={dimension}D" for source, dimension in dimensions.items()
+        )
+        raise ValueError(
+            f"Tactile embedding dimension mismatch: {details}. "
+            "Use matching PCA, AT, and LDP artifacts."
+        )
+
+
 def load_policy(
     ldp_checkpoint: Path,
     at_checkpoint: Path,
@@ -62,22 +171,18 @@ def load_policy(
     num_inference_steps: int,
     tactile_embedding_dim: int,
 ):
-    with ldp_checkpoint.open("rb") as file:
-        payload = torch.load(
-            file,
-            pickle_module=dill,
-            weights_only=False,
-            map_location="cpu",
-        )
-    cfg = copy.deepcopy(payload["cfg"])
+    payload = _load_checkpoint_payload(ldp_checkpoint, "LDP")
+    at_payload = _load_checkpoint_payload(at_checkpoint, "AT")
+    cfg = copy.deepcopy(_checkpoint_cfg(payload, "LDP", ldp_checkpoint))
+    at_cfg = _checkpoint_cfg(at_payload, "AT", at_checkpoint)
     OmegaConf.set_struct(cfg, False)
-    checkpoint_tactile_dim = int(cfg.shape_meta.obs.tactile_embedding.shape[0])
-    if checkpoint_tactile_dim != tactile_embedding_dim:
-        raise ValueError(
-            f"LDP checkpoint expects {checkpoint_tactile_dim}D tactile embeddings; "
-            f"the selected PCA produces {tactile_embedding_dim}D. "
-            "Use matching PCA, AT, and LDP artifacts."
-        )
+    validate_tactile_dimensions(
+        tactile_embedding_dim,
+        cfg,
+        at_cfg,
+        ldp_checkpoint,
+        at_checkpoint,
+    )
     cfg.at_load_dir = str(at_checkpoint)
     cfg.policy.at.load_dir = str(at_checkpoint)
     cfg.policy.at.device = str(device)

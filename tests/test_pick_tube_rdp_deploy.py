@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from torch import nn
 from omegaconf import OmegaConf
@@ -27,7 +28,8 @@ class FakeTactileEncoder(nn.Module):
 
 
 class FakePolicy:
-    def __init__(self) -> None:
+    def __init__(self, components_per_arm: int) -> None:
+        self.components_per_arm = components_per_arm
         self.slow_calls = 0
         self.fast_history_lengths = []
         self.slow_observation_states = []
@@ -36,14 +38,15 @@ class FakePolicy:
         assert tuple(obs_dict["camera1"].shape) == (1, 2, 3, 224, 224)
         assert tuple(obs_dict["camera2"].shape) == (1, 2, 3, 224, 224)
         assert tuple(obs_dict["observation_state"].shape) == (1, 2, 20)
-        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, 30)
+        tactile_dim = self.components_per_arm * 2
+        assert tuple(obs_dict["tactile_embedding"].shape) == (1, 2, tactile_dim)
         torch.testing.assert_close(
-            obs_dict["tactile_embedding"][0, :, :15],
-            torch.full((2, 15), 1.0 / 255.0),
+            obs_dict["tactile_embedding"][0, :, : self.components_per_arm],
+            torch.full((2, self.components_per_arm), 1.0 / 255.0),
         )
         torch.testing.assert_close(
-            obs_dict["tactile_embedding"][0, :, 15:],
-            torch.full((2, 15), 3.0 / 255.0),
+            obs_dict["tactile_embedding"][0, :, self.components_per_arm :],
+            torch.full((2, self.components_per_arm), 3.0 / 255.0),
         )
         assert kwargs["return_latent_action"] is True
         self.slow_observation_states.append(
@@ -62,6 +65,7 @@ class FakePolicy:
         assert tuple(latent_action.shape) == (1, 128)
         assert dataset_obs_temporal_downsample_ratio == 2
         history_length = extended_obs["tactile_embedding"].shape[1]
+        assert extended_obs["tactile_embedding"].shape[2] == self.components_per_arm * 2
         assert extended_obs_last_step == history_length
         self.fast_history_lengths.append(history_length)
         return {"action": torch.full((1, history_length, 20), float(history_length))}
@@ -76,6 +80,61 @@ def observation(step: int = 0) -> dict:
     for value, key in enumerate(deploy.TACTILE_KEYS, start=1):
         result[key] = np.full((224, 224, 3), value, dtype=np.uint8)
     return result
+
+
+def tactile_cfg(obs_dim: int, extended_dim: int | None = None):
+    return OmegaConf.create(
+        {
+            "shape_meta": {
+                "obs": {"tactile_embedding": {"shape": [obs_dim]}},
+                "extended_obs": {
+                    "tactile_embedding": {
+                        "shape": [obs_dim if extended_dim is None else extended_dim]
+                    }
+                },
+            }
+        }
+    )
+
+
+class FakeAT:
+    def __init__(self) -> None:
+        self.normalizer = None
+
+    def set_normalizer(self, normalizer) -> None:
+        self.normalizer = normalizer
+
+
+class LoadedFakePolicy:
+    def __init__(self) -> None:
+        self.at = FakeAT()
+        self.normalizer = object()
+        self.num_inference_steps = None
+        self.eval_called = False
+        self.device = None
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+    def to(self, device):
+        self.device = device
+        return self
+
+
+def policy_cfg(tactile_dim: int):
+    cfg = tactile_cfg(tactile_dim)
+    cfg._target_ = "tests.FakeWorkspace"
+    cfg.policy = {
+        "at": {},
+        "obs_encoder": {"random_transforms": []},
+    }
+    cfg.training = {"use_ema": True}
+    return cfg
+
+
+def payload(cfg):
+    return {"cfg": cfg}
 
 
 def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
@@ -106,12 +165,245 @@ def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
     ) == [{"type": "RandomCrop", "ratio": 0.9}]
 
 
-def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step() -> None:
-    policy = FakePolicy()
+@pytest.mark.parametrize("tactile_dim", [16, 30, 60])
+def test_validate_tactile_dimensions_accepts_matching_artifacts(
+    tactile_dim: int,
+) -> None:
+    deploy.validate_tactile_dimensions(
+        tactile_dim,
+        tactile_cfg(tactile_dim),
+        tactile_cfg(tactile_dim),
+        Path("ldp.ckpt"),
+        Path("at.ckpt"),
+    )
+
+
+def test_validate_tactile_dimensions_reports_every_source() -> None:
+    with pytest.raises(ValueError) as error:
+        deploy.validate_tactile_dimensions(
+            16,
+            tactile_cfg(16, extended_dim=30),
+            tactile_cfg(60),
+            Path("ldp.ckpt"),
+            Path("at.ckpt"),
+        )
+
+    message = str(error.value)
+    assert "PCA output=16D" in message
+    assert "LDP obs (ldp.ckpt)=16D" in message
+    assert "LDP extended_obs (ldp.ckpt)=30D" in message
+    assert "AT obs (at.ckpt)=60D" in message
+    assert "AT extended_obs (at.ckpt)=60D" in message
+
+
+def test_tactile_dim_reports_missing_checkpoint_field() -> None:
+    with pytest.raises(ValueError, match="LDP checkpoint is missing"):
+        deploy._tactile_dim(OmegaConf.create({}), "LDP", "obs")
+
+
+@pytest.mark.parametrize("role", ["LDP", "AT"])
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        pytest.param(None, id="non-mapping-payload"),
+        pytest.param({}, id="missing-cfg"),
+        pytest.param({"cfg": None}, id="none-cfg"),
+        pytest.param({"cfg": 16}, id="scalar-cfg"),
+        pytest.param({"cfg": []}, id="list-cfg"),
+    ],
+)
+def test_load_policy_reports_checkpoint_payload_cfg_errors(role, invalid_payload, monkeypatch) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    valid_payload = payload(policy_cfg(16))
+
+    def load_payload(path, current_role):
+        if current_role == role:
+            return invalid_payload
+        return valid_payload
+
+    monkeypatch.setattr(deploy, "_load_checkpoint_payload", load_payload)
+
+    with pytest.raises(ValueError) as error:
+        deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=8,
+            tactile_embedding_dim=16,
+        )
+
+    message = str(error.value)
+    assert role in message
+    assert str(ldp_checkpoint if role == "LDP" else at_checkpoint) in message
+    assert "cfg" in message
+
+
+def test_load_policy_reports_unresolved_checkpoint_metadata(monkeypatch) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    ldp_cfg = policy_cfg(16)
+    ldp_cfg.shape_meta.obs.tactile_embedding.shape = ["${missing_dimension}"]
+
+    monkeypatch.setattr(
+        deploy,
+        "_load_checkpoint_payload",
+        lambda path, role: payload(ldp_cfg if role == "LDP" else policy_cfg(16)),
+    )
+
+    with pytest.raises(ValueError) as error:
+        deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=8,
+            tactile_embedding_dim=16,
+        )
+
+    message = str(error.value)
+    assert "LDP" in message
+    assert str(ldp_checkpoint) in message
+    assert "shape_meta.obs.tactile_embedding.shape" in message
+    assert error.value.__cause__ is not None
+
+
+def test_load_policy_validates_matching_payloads_before_workspace_construction(monkeypatch) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    ldp_cfg_mapping = OmegaConf.to_container(policy_cfg(30), resolve=False)
+    at_cfg_mapping = OmegaConf.to_container(tactile_cfg(30), resolve=False)
+    ldp_payload = payload(ldp_cfg_mapping)
+    at_payload = payload(at_cfg_mapping)
+    payload_calls = []
+    validated = False
+    workspace_instances = []
+    original_validate = deploy.validate_tactile_dimensions
+
+    def load_payload(path, role):
+        payload_calls.append((path, role))
+        return ldp_payload if role == "LDP" else at_payload
+
+    def validate(*args):
+        nonlocal validated
+        assert OmegaConf.is_config(args[1])
+        assert OmegaConf.is_config(args[2])
+        assert OmegaConf.to_container(args[1], resolve=False) == ldp_cfg_mapping
+        assert OmegaConf.to_container(args[2], resolve=False) == at_cfg_mapping
+        original_validate(*args)
+        validated = True
+
+    class FakeWorkspace:
+        def __init__(self, cfg):
+            assert validated
+            self.cfg = cfg
+            self.ema_model = LoadedFakePolicy()
+            self.model = LoadedFakePolicy()
+            self.normalizer = object()
+            self.loaded_payload = None
+            workspace_instances.append(self)
+
+        def load_payload(self, loaded_payload):
+            self.loaded_payload = loaded_payload
+
+    monkeypatch.setattr(deploy, "_load_checkpoint_payload", load_payload)
+    monkeypatch.setattr(deploy, "validate_tactile_dimensions", validate)
+    monkeypatch.setattr(deploy.hydra.utils, "get_class", lambda target: FakeWorkspace)
+
+    policy, cfg = deploy.load_policy(
+        ldp_checkpoint,
+        at_checkpoint,
+        torch.device("cpu"),
+        num_inference_steps=7,
+        tactile_embedding_dim=30,
+    )
+
+    assert payload_calls == [(ldp_checkpoint, "LDP"), (at_checkpoint, "AT")]
+    assert len(workspace_instances) == 1
+    assert workspace_instances[0].loaded_payload is ldp_payload
+    assert policy is workspace_instances[0].ema_model
+    assert cfg.at_load_dir == str(at_checkpoint)
+    assert policy.at.normalizer is policy.normalizer
+    assert policy.num_inference_steps == 7
+    assert policy.eval_called
+    assert policy.device == torch.device("cpu")
+
+
+@pytest.mark.parametrize(
+    ("pca_dim", "ldp_obs", "ldp_extended_obs", "at_obs", "at_extended_obs", "source"),
+    [
+        pytest.param(16, 30, 30, 30, 30, "PCA output", id="pca"),
+        pytest.param(30, 16, 30, 30, 30, "LDP obs", id="ldp-obs"),
+        pytest.param(30, 30, 16, 30, 30, "LDP extended_obs", id="ldp-extended-obs"),
+        pytest.param(30, 30, 30, 16, 30, "AT obs", id="at-obs"),
+        pytest.param(30, 30, 30, 30, 16, "AT extended_obs", id="at-extended-obs"),
+    ],
+)
+def test_load_policy_rejects_each_mismatched_tactile_dimension_before_workspace(
+    monkeypatch,
+    pca_dim,
+    ldp_obs,
+    ldp_extended_obs,
+    at_obs,
+    at_extended_obs,
+    source,
+) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    ldp_payload = payload(policy_cfg(ldp_obs))
+    ldp_payload["cfg"].shape_meta.extended_obs.tactile_embedding.shape = [ldp_extended_obs]
+    at_payload = payload(tactile_cfg(at_obs, at_extended_obs))
+
+    monkeypatch.setattr(
+        deploy,
+        "_load_checkpoint_payload",
+        lambda path, role: ldp_payload if role == "LDP" else at_payload,
+    )
+    monkeypatch.setattr(
+        deploy.hydra.utils,
+        "get_class",
+        lambda target: pytest.fail("workspace construction must follow validation"),
+    )
+
+    with pytest.raises(ValueError, match=source):
+        deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=8,
+            tactile_embedding_dim=pca_dim,
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(16, id="scalar"),
+        pytest.param("7", id="string"),
+        pytest.param([16.9], id="fractional"),
+        pytest.param([True], id="boolean"),
+        pytest.param([16, 30], id="multiple_items"),
+        pytest.param([0], id="zero"),
+        pytest.param([-1], id="negative"),
+    ],
+)
+def test_tactile_dim_rejects_malformed_shapes(shape) -> None:
+    cfg = OmegaConf.create(
+        {"shape_meta": {"obs": {"tactile_embedding": {"shape": shape}}}}
+    )
+
+    with pytest.raises(ValueError):
+        deploy._tactile_dim(cfg, "LDP", "obs")
+
+
+@pytest.mark.parametrize("components_per_arm", [8, 15, 30])
+def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step(
+    components_per_arm: int,
+) -> None:
+    policy = FakePolicy(components_per_arm)
     encoder = FakeTactileEncoder()
     means = np.zeros((2, 1024), dtype=np.float32)
-    components = np.zeros((2, 15, 1024), dtype=np.float32)
-    components[:, np.arange(15), np.arange(15)] = 1.0
+    components = np.zeros((2, components_per_arm, 1024), dtype=np.float32)
+    components[:, np.arange(components_per_arm), np.arange(components_per_arm)] = 1.0
     tactile_pca = deploy.BimanualTactilePCA(means, components)
     runtime = deploy.PickTubeRDPRuntime(
         policy,

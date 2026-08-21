@@ -25,6 +25,8 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 TACTILE_DIM=${TACTILE_DIM:-30}
 AT_CHECKPOINT_EVERY=${AT_CHECKPOINT_EVERY:-1}
 LDP_CHECKPOINT_EVERY=${LDP_CHECKPOINT_EVERY:-1}
+AT_CHECKPOINT_KEEP=${AT_CHECKPOINT_KEEP:-1}
+LDP_CHECKPOINT_KEEP=${LDP_CHECKPOINT_KEEP:-1}
 RESUME=${RESUME:-true}
 VALIDATE_DATASET=${VALIDATE_DATASET:-1}
 DRY_RUN=${DRY_RUN:-0}
@@ -61,6 +63,7 @@ Common environment overrides:
   TACTILE_DIM=30              # total PCA output dimension across both arms
   MIXED_PRECISION=bf16        # use "no" to disable Accelerate mixed precision
   AT_CHECKPOINT_EVERY=1 LDP_CHECKPOINT_EVERY=1
+  AT_CHECKPOINT_KEEP=1 LDP_CHECKPOINT_KEEP=1
   RESUME=true VALIDATE_DATASET=1 LOGGING_MODE=offline
   DRY_RUN=1                  # print commands without starting training
 USAGE
@@ -104,6 +107,13 @@ if [[ "${MIXED_PRECISION}" != "no" && "${MIXED_PRECISION}" != "fp16" && "${MIXED
   echo "MIXED_PRECISION must be no, fp16, or bf16, got: ${MIXED_PRECISION}" >&2
   exit 2
 fi
+for value_name in AT_CHECKPOINT_KEEP LDP_CHECKPOINT_KEEP; do
+  value=${!value_name}
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${value_name} must be a non-negative integer, got: ${value}" >&2
+    exit 2
+  fi
+done
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Training Python not found: ${PYTHON_BIN}" >&2
@@ -154,12 +164,14 @@ train_at() {
     --config-name=train_pick_tube_at_workspace
     "task.dataset_path=${DATASET_PATH}"
     "task.tactile_embedding_dim=${TACTILE_DIM}"
+    "exp_name=${RUN_ID}"
     "hydra.run.dir=${AT_DIR}"
     "logging.mode=${LOGGING_MODE}"
     "training.device=cuda:0"
     "training.resume=${RESUME}"
     "training.num_epochs=${AT_EPOCHS}"
     "training.checkpoint_every=${AT_CHECKPOINT_EVERY}"
+    "checkpoint.topk.k=${AT_CHECKPOINT_KEEP}"
     "+training.mixed_precision=${MIXED_PRECISION}"
     "dataloader.batch_size=${AT_BATCH}"
     "val_dataloader.batch_size=${AT_BATCH}"
@@ -209,6 +221,7 @@ train_ldp() {
     --config-name=train_pick_tube_ldp_workspace
     "task.dataset_path=${DATASET_PATH}"
     "task.tactile_embedding_dim=${TACTILE_DIM}"
+    "exp_name=${RUN_ID}"
     # Keep the checkpoint path quoted for Hydra's override parser. Checkpoint
     # filenames commonly contain '=' (for example epoch=0019-train_loss=...).
     "at_load_dir='${AT_CKPT}'"
@@ -217,6 +230,7 @@ train_ldp() {
     "training.resume=${RESUME}"
     "training.num_epochs=${LDP_EPOCHS}"
     "training.checkpoint_every=${LDP_CHECKPOINT_EVERY}"
+    "checkpoint.topk.k=${LDP_CHECKPOINT_KEEP}"
     "dataloader.batch_size=${LDP_BATCH}"
     "val_dataloader.batch_size=${LDP_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"
