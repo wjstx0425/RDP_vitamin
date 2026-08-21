@@ -65,3 +65,19 @@ def test_pca_rejects_non_finite_values(field: str) -> None:
 
     with pytest.raises(ValueError, match=f"PCA {field} must contain only finite values"):
         BimanualTactilePCA(means, components)
+
+
+@pytest.mark.parametrize("field", ["means", "components"])
+@pytest.mark.parametrize("dtype", [np.complex64, object])
+def test_pca_rejects_complex_values_before_float32_conversion(field: str, dtype) -> None:
+    means = np.zeros((2, 1024), dtype=np.float32)
+    components = np.zeros((2, 8, 1024), dtype=np.float32)
+    if field == "means":
+        means = means.astype(dtype)
+        means[0, 0] = 1.0 + np.inf * 1j
+    else:
+        components = components.astype(dtype)
+        components[0, 0, 0] = 1.0 + np.inf * 1j
+
+    with pytest.raises(ValueError, match=f"PCA {field} must contain real values"):
+        BimanualTactilePCA(means, components)

@@ -97,6 +97,46 @@ def tactile_cfg(obs_dim: int, extended_dim: int | None = None):
     )
 
 
+class FakeAT:
+    def __init__(self) -> None:
+        self.normalizer = None
+
+    def set_normalizer(self, normalizer) -> None:
+        self.normalizer = normalizer
+
+
+class LoadedFakePolicy:
+    def __init__(self) -> None:
+        self.at = FakeAT()
+        self.normalizer = object()
+        self.num_inference_steps = None
+        self.eval_called = False
+        self.device = None
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+    def to(self, device):
+        self.device = device
+        return self
+
+
+def policy_cfg(tactile_dim: int):
+    cfg = tactile_cfg(tactile_dim)
+    cfg._target_ = "tests.FakeWorkspace"
+    cfg.policy = {
+        "at": {},
+        "obs_encoder": {"random_transforms": []},
+    }
+    cfg.training = {"use_ema": True}
+    return cfg
+
+
+def payload(cfg):
+    return {"cfg": cfg}
+
+
 def test_prepare_inference_config_drops_training_only_color_jitter() -> None:
     config = OmegaConf.create(
         {
@@ -159,6 +199,166 @@ def test_validate_tactile_dimensions_reports_every_source() -> None:
 def test_tactile_dim_reports_missing_checkpoint_field() -> None:
     with pytest.raises(ValueError, match="LDP checkpoint is missing"):
         deploy._tactile_dim(OmegaConf.create({}), "LDP", "obs")
+
+
+@pytest.mark.parametrize("role", ["LDP", "AT"])
+@pytest.mark.parametrize("invalid_payload", [None, {}, {"cfg": None}])
+def test_load_policy_reports_checkpoint_payload_cfg_errors(role, invalid_payload, monkeypatch) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    valid_payload = payload(policy_cfg(16))
+
+    def load_payload(path, current_role):
+        if current_role == role:
+            return invalid_payload
+        return valid_payload
+
+    monkeypatch.setattr(deploy, "_load_checkpoint_payload", load_payload)
+
+    with pytest.raises(ValueError) as error:
+        deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=8,
+            tactile_embedding_dim=16,
+        )
+
+    message = str(error.value)
+    assert role in message
+    assert str(ldp_checkpoint if role == "LDP" else at_checkpoint) in message
+    assert "cfg" in message
+
+
+def test_load_policy_reports_unresolved_checkpoint_metadata(monkeypatch) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    ldp_cfg = policy_cfg(16)
+    ldp_cfg.shape_meta.obs.tactile_embedding.shape = ["${missing_dimension}"]
+
+    monkeypatch.setattr(
+        deploy,
+        "_load_checkpoint_payload",
+        lambda path, role: payload(ldp_cfg if role == "LDP" else policy_cfg(16)),
+    )
+
+    with pytest.raises(ValueError) as error:
+        deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=8,
+            tactile_embedding_dim=16,
+        )
+
+    message = str(error.value)
+    assert "LDP" in message
+    assert str(ldp_checkpoint) in message
+    assert "shape_meta.obs.tactile_embedding.shape" in message
+    assert error.value.__cause__ is not None
+
+
+def test_load_policy_validates_matching_payloads_before_workspace_construction(monkeypatch) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    ldp_payload = payload(policy_cfg(30))
+    at_payload = payload(tactile_cfg(30))
+    payload_calls = []
+    validated = False
+    workspace_instances = []
+    original_validate = deploy.validate_tactile_dimensions
+
+    def load_payload(path, role):
+        payload_calls.append((path, role))
+        return ldp_payload if role == "LDP" else at_payload
+
+    def validate(*args):
+        nonlocal validated
+        assert args[1] == ldp_payload["cfg"]
+        assert args[2] is at_payload["cfg"]
+        original_validate(*args)
+        validated = True
+
+    class FakeWorkspace:
+        def __init__(self, cfg):
+            assert validated
+            self.cfg = cfg
+            self.ema_model = LoadedFakePolicy()
+            self.model = LoadedFakePolicy()
+            self.normalizer = object()
+            self.loaded_payload = None
+            workspace_instances.append(self)
+
+        def load_payload(self, loaded_payload):
+            self.loaded_payload = loaded_payload
+
+    monkeypatch.setattr(deploy, "_load_checkpoint_payload", load_payload)
+    monkeypatch.setattr(deploy, "validate_tactile_dimensions", validate)
+    monkeypatch.setattr(deploy.hydra.utils, "get_class", lambda target: FakeWorkspace)
+
+    policy, cfg = deploy.load_policy(
+        ldp_checkpoint,
+        at_checkpoint,
+        torch.device("cpu"),
+        num_inference_steps=7,
+        tactile_embedding_dim=30,
+    )
+
+    assert payload_calls == [(ldp_checkpoint, "LDP"), (at_checkpoint, "AT")]
+    assert len(workspace_instances) == 1
+    assert workspace_instances[0].loaded_payload is ldp_payload
+    assert policy is workspace_instances[0].ema_model
+    assert cfg.at_load_dir == str(at_checkpoint)
+    assert policy.at.normalizer is policy.normalizer
+    assert policy.num_inference_steps == 7
+    assert policy.eval_called
+    assert policy.device == torch.device("cpu")
+
+
+@pytest.mark.parametrize(
+    ("pca_dim", "ldp_obs", "ldp_extended_obs", "at_obs", "at_extended_obs", "source"),
+    [
+        pytest.param(16, 30, 30, 30, 30, "PCA output", id="pca"),
+        pytest.param(30, 16, 30, 30, 30, "LDP obs", id="ldp-obs"),
+        pytest.param(30, 30, 16, 30, 30, "LDP extended_obs", id="ldp-extended-obs"),
+        pytest.param(30, 30, 30, 16, 30, "AT obs", id="at-obs"),
+        pytest.param(30, 30, 30, 30, 16, "AT extended_obs", id="at-extended-obs"),
+    ],
+)
+def test_load_policy_rejects_each_mismatched_tactile_dimension_before_workspace(
+    monkeypatch,
+    pca_dim,
+    ldp_obs,
+    ldp_extended_obs,
+    at_obs,
+    at_extended_obs,
+    source,
+) -> None:
+    ldp_checkpoint = Path("ldp.ckpt")
+    at_checkpoint = Path("at.ckpt")
+    ldp_payload = payload(policy_cfg(ldp_obs))
+    ldp_payload["cfg"].shape_meta.extended_obs.tactile_embedding.shape = [ldp_extended_obs]
+    at_payload = payload(tactile_cfg(at_obs, at_extended_obs))
+
+    monkeypatch.setattr(
+        deploy,
+        "_load_checkpoint_payload",
+        lambda path, role: ldp_payload if role == "LDP" else at_payload,
+    )
+    monkeypatch.setattr(
+        deploy.hydra.utils,
+        "get_class",
+        lambda target: pytest.fail("workspace construction must follow validation"),
+    )
+
+    with pytest.raises(ValueError, match=source):
+        deploy.load_policy(
+            ldp_checkpoint,
+            at_checkpoint,
+            torch.device("cpu"),
+            num_inference_steps=8,
+            tactile_embedding_dim=pca_dim,
+        )
 
 
 @pytest.mark.parametrize(

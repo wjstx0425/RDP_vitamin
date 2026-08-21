@@ -25,6 +25,12 @@ REDUCED_TACTILE_DIM = COMPONENTS_PER_ARM * ARM_COUNT
 PCA_FORMAT_VERSION = 1
 
 
+def _contains_complex_values(values: np.ndarray) -> bool:
+    return np.iscomplexobj(values) or (
+        values.dtype == object and any(np.iscomplexobj(value) for value in values.flat)
+    )
+
+
 def group_tactile_embeddings(values: np.ndarray) -> np.ndarray:
     """Return ``[..., 2, 1024]`` values grouped by robot arm.
 
@@ -59,6 +65,12 @@ class BimanualTactilePCA(nn.Module):
 
     def __init__(self, means: np.ndarray, components: np.ndarray) -> None:
         super().__init__()
+        means = np.asarray(means)
+        components = np.asarray(components)
+        if _contains_complex_values(means):
+            raise ValueError("PCA means must contain real values")
+        if _contains_complex_values(components):
+            raise ValueError("PCA components must contain real values")
         means = np.asarray(means, dtype=np.float32)
         components = np.asarray(components, dtype=np.float32)
         if means.shape != (ARM_COUNT, ARM_INPUT_DIM):
