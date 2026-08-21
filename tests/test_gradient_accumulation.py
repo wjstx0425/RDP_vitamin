@@ -1,3 +1,4 @@
+import inspect
 import math
 
 import pytest
@@ -47,6 +48,56 @@ def test_at_and_ldp_workspaces_share_the_accumulation_boundary_helper():
         train_diffusion_unet_image_workspace.should_optimizer_step
         is train_at_workspace.should_optimizer_step
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "num_batches",
+        "max_train_steps",
+        "accumulate_every",
+        "num_epochs",
+        "expected",
+    ),
+    [
+        (7, None, 2, 3, 12),
+        (7, 5, 2, 3, 9),
+        (7, 5, 3, 2, 4),
+        (7, 1, 3, 4, 4),
+    ],
+)
+def test_scheduler_steps_use_effective_batches_and_include_partial_group(
+    num_batches,
+    max_train_steps,
+    accumulate_every,
+    num_epochs,
+    expected,
+):
+    assert train_at_workspace.get_num_training_steps(
+        num_batches=num_batches,
+        max_train_steps=max_train_steps,
+        accumulate_every=accumulate_every,
+        num_epochs=num_epochs,
+    ) == expected
+
+
+def test_at_and_ldp_workspaces_share_scheduler_step_count_helper():
+    assert (
+        train_diffusion_unet_image_workspace.get_num_training_steps
+        is train_at_workspace.get_num_training_steps
+    )
+
+
+@pytest.mark.parametrize(
+    "workspace_class",
+    [
+        train_at_workspace.TrainATWorkspace,
+        train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace,
+    ],
+)
+def test_workspaces_use_effective_scheduler_step_count(workspace_class):
+    source = inspect.getsource(workspace_class.run)
+
+    assert "num_training_steps=get_num_training_steps(" in source
 
 
 def test_workspaces_persist_optimizer_step_separately_from_batch_logging_step():

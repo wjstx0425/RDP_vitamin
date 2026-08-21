@@ -41,6 +41,29 @@ def should_optimizer_step(batch_idx, num_batches, accumulate_every):
     )
 
 
+def get_effective_num_batches(num_batches, max_train_steps):
+    num_batches = int(num_batches)
+    if max_train_steps is not None:
+        num_batches = min(num_batches, int(max_train_steps))
+    return num_batches
+
+
+def get_num_training_steps(
+    num_batches,
+    max_train_steps,
+    accumulate_every,
+    num_epochs,
+):
+    accumulate_every = int(accumulate_every)
+    if accumulate_every < 1:
+        raise ValueError("accumulate_every must be positive")
+    effective_batches = get_effective_num_batches(
+        num_batches,
+        max_train_steps,
+    )
+    return math.ceil(effective_batches / accumulate_every) * int(num_epochs)
+
+
 class TrainATWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'optimizer_step', 'epoch']
 
@@ -67,6 +90,13 @@ class TrainATWorkspace(BaseWorkspace):
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+
+        if cfg.training.debug:
+            cfg.training.num_epochs = 2
+            cfg.training.max_train_steps = 3
+            cfg.training.max_val_steps = 3
+            cfg.training.checkpoint_every = 1
+            cfg.training.val_every = 1
 
         # resume training
         resumed = False
@@ -106,12 +136,11 @@ class TrainATWorkspace(BaseWorkspace):
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                math.ceil(
-                    len(train_dataloader)
-                    / cfg.training.gradient_accumulate_every
-                )
-                * cfg.training.num_epochs
+            num_training_steps=get_num_training_steps(
+                num_batches=len(train_dataloader),
+                max_train_steps=cfg.training.max_train_steps,
+                accumulate_every=cfg.training.gradient_accumulate_every,
+                num_epochs=cfg.training.num_epochs,
             ),
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
@@ -145,19 +174,10 @@ class TrainATWorkspace(BaseWorkspace):
         # save batch for sampling
         train_sampling_batch = None
 
-        if cfg.training.debug:
-            cfg.training.num_epochs = 2
-            cfg.training.max_train_steps = 3
-            cfg.training.max_val_steps = 3
-            cfg.training.checkpoint_every = 1
-            cfg.training.val_every = 1
-
-        num_train_batches = len(train_dataloader)
-        if cfg.training.max_train_steps is not None:
-            num_train_batches = min(
-                num_train_batches,
-                cfg.training.max_train_steps,
-            )
+        num_train_batches = get_effective_num_batches(
+            len(train_dataloader),
+            cfg.training.max_train_steps,
+        )
 
         num_epochs_to_run = self.get_remaining_epochs(cfg.training.num_epochs)
         if resumed:

@@ -32,7 +32,11 @@ from reactive_diffusion_policy.model.common.lr_scheduler import get_scheduler
 from reactive_diffusion_policy.model.common.lr_decay import param_groups_lrd
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from reactive_diffusion_policy.workspace.train_at_workspace import should_optimizer_step
+from reactive_diffusion_policy.workspace.train_at_workspace import (
+    get_effective_num_batches,
+    get_num_training_steps,
+    should_optimizer_step,
+)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -121,6 +125,15 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
+        if cfg.training.debug:
+            cfg.training.num_epochs = 2
+            cfg.training.max_train_steps = 3
+            cfg.training.max_val_steps = 3
+            cfg.training.rollout_every = 1
+            cfg.training.checkpoint_every = 1
+            cfg.training.val_every = 1
+            cfg.training.sample_every = 1
+
         accelerator = Accelerator(
             log_with='wandb',
             kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
@@ -187,12 +200,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                math.ceil(
-                    len(train_dataloader)
-                    / cfg.training.gradient_accumulate_every
-                )
-                * cfg.training.num_epochs
+            num_training_steps=get_num_training_steps(
+                num_batches=len(train_dataloader),
+                max_train_steps=cfg.training.max_train_steps,
+                accumulate_every=cfg.training.gradient_accumulate_every,
+                num_epochs=cfg.training.num_epochs,
             ),
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
@@ -241,21 +253,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # save batch for sampling
         train_sampling_batch = None
 
-        if cfg.training.debug:
-            cfg.training.num_epochs = 2
-            cfg.training.max_train_steps = 3
-            cfg.training.max_val_steps = 3
-            cfg.training.rollout_every = 1
-            cfg.training.checkpoint_every = 1
-            cfg.training.val_every = 1
-            cfg.training.sample_every = 1
-
-        num_train_batches = len(train_dataloader)
-        if cfg.training.max_train_steps is not None:
-            num_train_batches = min(
-                num_train_batches,
-                cfg.training.max_train_steps,
-            )
+        num_train_batches = get_effective_num_batches(
+            len(train_dataloader),
+            cfg.training.max_train_steps,
+        )
 
         num_epochs_to_run = self.get_remaining_epochs(cfg.training.num_epochs)
         if resumed:
