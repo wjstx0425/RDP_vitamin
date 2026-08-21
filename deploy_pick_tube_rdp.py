@@ -79,7 +79,20 @@ def _checkpoint_cfg(payload: Any, role: str, checkpoint: Path) -> Any:
     cfg = payload["cfg"]
     if cfg is None:
         raise ValueError(f"{role} checkpoint {checkpoint} has cfg=None")
-    return cfg
+    if OmegaConf.is_dict(cfg):
+        return cfg
+    if isinstance(cfg, Mapping) and not OmegaConf.is_config(cfg):
+        try:
+            return OmegaConf.create(cfg)
+        except Exception as exc:
+            raise ValueError(
+                f"{role} checkpoint {checkpoint} cfg could not be normalized "
+                f"as mapping metadata: {exc}"
+            ) from exc
+    raise ValueError(
+        f"{role} checkpoint {checkpoint} cfg must be mapping metadata, "
+        f"got {type(cfg).__name__}"
+    )
 
 
 def _tactile_dim(

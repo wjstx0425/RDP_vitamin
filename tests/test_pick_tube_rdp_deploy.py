@@ -202,7 +202,16 @@ def test_tactile_dim_reports_missing_checkpoint_field() -> None:
 
 
 @pytest.mark.parametrize("role", ["LDP", "AT"])
-@pytest.mark.parametrize("invalid_payload", [None, {}, {"cfg": None}])
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        pytest.param(None, id="non-mapping-payload"),
+        pytest.param({}, id="missing-cfg"),
+        pytest.param({"cfg": None}, id="none-cfg"),
+        pytest.param({"cfg": 16}, id="scalar-cfg"),
+        pytest.param({"cfg": []}, id="list-cfg"),
+    ],
+)
 def test_load_policy_reports_checkpoint_payload_cfg_errors(role, invalid_payload, monkeypatch) -> None:
     ldp_checkpoint = Path("ldp.ckpt")
     at_checkpoint = Path("at.ckpt")
@@ -261,8 +270,10 @@ def test_load_policy_reports_unresolved_checkpoint_metadata(monkeypatch) -> None
 def test_load_policy_validates_matching_payloads_before_workspace_construction(monkeypatch) -> None:
     ldp_checkpoint = Path("ldp.ckpt")
     at_checkpoint = Path("at.ckpt")
-    ldp_payload = payload(policy_cfg(30))
-    at_payload = payload(tactile_cfg(30))
+    ldp_cfg_mapping = OmegaConf.to_container(policy_cfg(30), resolve=False)
+    at_cfg_mapping = OmegaConf.to_container(tactile_cfg(30), resolve=False)
+    ldp_payload = payload(ldp_cfg_mapping)
+    at_payload = payload(at_cfg_mapping)
     payload_calls = []
     validated = False
     workspace_instances = []
@@ -274,8 +285,10 @@ def test_load_policy_validates_matching_payloads_before_workspace_construction(m
 
     def validate(*args):
         nonlocal validated
-        assert args[1] == ldp_payload["cfg"]
-        assert args[2] is at_payload["cfg"]
+        assert OmegaConf.is_config(args[1])
+        assert OmegaConf.is_config(args[2])
+        assert OmegaConf.to_container(args[1], resolve=False) == ldp_cfg_mapping
+        assert OmegaConf.to_container(args[2], resolve=False) == at_cfg_mapping
         original_validate(*args)
         validated = True
 
