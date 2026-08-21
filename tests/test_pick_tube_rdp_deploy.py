@@ -161,6 +161,27 @@ def test_tactile_dim_reports_missing_checkpoint_field() -> None:
         deploy._tactile_dim(OmegaConf.create({}), "LDP", "obs")
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(16, id="scalar"),
+        pytest.param("7", id="string"),
+        pytest.param([16.9], id="fractional"),
+        pytest.param([True], id="boolean"),
+        pytest.param([16, 30], id="multiple_items"),
+        pytest.param([0], id="zero"),
+        pytest.param([-1], id="negative"),
+    ],
+)
+def test_tactile_dim_rejects_malformed_shapes(shape) -> None:
+    cfg = OmegaConf.create(
+        {"shape_meta": {"obs": {"tactile_embedding": {"shape": shape}}}}
+    )
+
+    with pytest.raises(ValueError):
+        deploy._tactile_dim(cfg, "LDP", "obs")
+
+
 @pytest.mark.parametrize("components_per_arm", [8, 15, 30])
 def test_runtime_updates_slow_plan_every_five_steps_and_decodes_every_step(
     components_per_arm: int,

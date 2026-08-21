@@ -7,6 +7,7 @@ import argparse
 import copy
 import os
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -71,10 +72,14 @@ def _load_checkpoint_payload(path: Path, role: str) -> dict[str, Any]:
 def _tactile_dim(cfg: Any, role: str, field: str) -> int:
     key = f"shape_meta.{field}.tactile_embedding.shape"
     shape = OmegaConf.select(cfg, key)
-    if shape is None or len(shape) != 1:
+    if (
+        not isinstance(shape, Sequence)
+        or isinstance(shape, (str, bytes))
+        or len(shape) != 1
+    ):
         raise ValueError(f"{role} checkpoint is missing a valid {key}")
-    dimension = int(shape[0])
-    if dimension < 1:
+    dimension = shape[0]
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 1:
         raise ValueError(f"{role} checkpoint has invalid {key}: {list(shape)}")
     return dimension
 
