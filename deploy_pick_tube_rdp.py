@@ -208,6 +208,7 @@ def validate_artifact_pairing(
         ("action_representation_version", "action representation"),
         ("action_contract", "action contract"),
         ("normalizer_version", "normalizer version"),
+        ("normalizer_sha256", "normalizer"),
         ("pca_sha256", "PCA"),
         ("tactile_cache_sha256", "tactile cache"),
     )

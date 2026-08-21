@@ -12,6 +12,7 @@ from reactive_diffusion_policy.common.artifact_manifest import (
     ArtifactManifest,
     build_normalizer_cache_signature,
     load_normalizer_cache,
+    normalizer_identity_digest,
     save_normalizer_cache,
     sha256_file,
     stable_json_digest,
@@ -169,10 +170,26 @@ def test_normalizer_cache_reuse_requires_exact_canonical_signature(tmp_path: Pat
 
     assert load_normalizer_cache(normalizer_path, signature) == expected
     meta_path = normalizer_path.with_name("normalizer.meta.json")
-    assert json.loads(meta_path.read_text(encoding="utf-8")) == signature
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert metadata["signature"] == signature
+    assert metadata["normalizer_sha256"] == sha256_file(normalizer_path)
     mismatch = json.loads(json.dumps(signature))
     mismatch["temporal"]["horizon"] += 1
     assert load_normalizer_cache(normalizer_path, mismatch) is None
+
+
+def test_normalizer_cache_rejects_mutated_pickle_even_when_signature_matches(
+    tmp_path: Path,
+) -> None:
+    normalizer_path = tmp_path / "normalizer.pkl"
+    at_path = tmp_path / "at.ckpt"
+    at_path.write_bytes(b"AT checkpoint")
+    signature = build_normalizer_cache_signature(_cfg(), _dataset(), at_path)
+    save_normalizer_cache(normalizer_path, {"normalizer": "original"}, signature)
+
+    normalizer_path.write_bytes(b"mutated after metadata publication")
+
+    assert load_normalizer_cache(normalizer_path, signature) is None
 
 
 def test_missing_cache_metadata_never_reuses_pickle(tmp_path: Path) -> None:
@@ -226,9 +243,35 @@ def test_training_workspace_checkpoint_cfg_carries_artifact_manifest(
 
     artifacts = OmegaConf.to_container(payload["cfg"].artifacts, resolve=True)
     assert artifacts["dataset_digest"] == "d" * 64
-    assert artifacts["normalizer_sha256"] == sha256_file(normalizer_path)
+    assert artifacts["normalizer_sha256"] == normalizer_identity_digest(signature)
     if uses_at:
         assert artifacts["at_sha256"] == sha256_file(at_path)
         assert artifacts["latent_target_mode"] == "posterior_mode_post_vq"
     else:
         assert "at_sha256" not in artifacts
+
+
+def test_at_and_ldp_share_action_normalizer_identity_despite_different_caches(
+    tmp_path: Path,
+) -> None:
+    at_checkpoint = tmp_path / "at-source.ckpt"
+    at_checkpoint.write_bytes(b"AT checkpoint")
+    artifact_values = []
+    for role, at_path, cache_bytes in (
+        ("AT", None, b"AT normalizer cache"),
+        ("LDP", at_checkpoint, b"LDP normalizer cache with latent statistics"),
+    ):
+        normalizer_path = tmp_path / f"{role.lower()}-normalizer.pkl"
+        normalizer_path.write_bytes(cache_bytes)
+        workspace = BaseWorkspace(
+            OmegaConf.create({"training": {"use_ema": False}}),
+            output_dir=str(tmp_path),
+        )
+        workspace.bind_checkpoint_artifacts(
+            build_normalizer_cache_signature(_cfg(), _dataset(), at_path),
+            normalizer_path=normalizer_path,
+            role=role,
+        )
+        artifact_values.append(workspace.cfg.artifacts.normalizer_sha256)
+
+    assert artifact_values[0] == artifact_values[1]

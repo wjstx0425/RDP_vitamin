@@ -9,7 +9,7 @@ import threading
 
 from reactive_diffusion_policy.common.artifact_manifest import (
     ArtifactManifest,
-    sha256_file,
+    normalizer_identity_digest,
 )
 
 
@@ -68,9 +68,11 @@ class BaseWorkspace:
 
     def bind_checkpoint_artifacts(self, signature, *, normalizer_path, role):
         """Bind the training inputs that this checkpoint is safe to use with."""
+        if not pathlib.Path(normalizer_path).is_file():
+            raise FileNotFoundError(f"normalizer cache does not exist: {normalizer_path}")
         manifest = ArtifactManifest.from_cache_signature(
             signature,
-            normalizer_sha256=sha256_file(pathlib.Path(normalizer_path)),
+            normalizer_sha256=normalizer_identity_digest(signature),
             role=role,
         )
         OmegaConf.update(

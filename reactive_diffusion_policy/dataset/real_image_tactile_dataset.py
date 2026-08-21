@@ -1,4 +1,5 @@
 from typing import Dict
+import json
 import torch
 import numpy as np
 import os
@@ -64,6 +65,18 @@ class RealImageTactileDataset(BaseImageDataset):
 
         zarr_path = os.path.join(dataset_path, 'replay_buffer.zarr')
         zarr_root = zarr.open_group(zarr_path, mode="r")
+        artifact_manifest_raw = zarr_root["meta"].attrs.get("v2_manifest_json")
+        artifact_manifest = None
+        if artifact_manifest_raw is not None:
+            if isinstance(artifact_manifest_raw, str):
+                try:
+                    artifact_manifest = json.loads(artifact_manifest_raw)
+                except json.JSONDecodeError as error:
+                    raise ValueError("dataset v2 artifact manifest is invalid JSON") from error
+            elif isinstance(artifact_manifest_raw, dict):
+                artifact_manifest = dict(artifact_manifest_raw)
+            else:
+                raise ValueError("dataset v2 artifact manifest must be JSON metadata")
         contract_keys = {"action_valid", "idle_arm_mask"}
         present_contract_keys = contract_keys.intersection(zarr_root["data"].keys())
         if present_contract_keys and present_contract_keys != contract_keys:
@@ -108,6 +121,8 @@ class RealImageTactileDataset(BaseImageDataset):
         self.relative_tcp_obs_for_relative_action = relative_tcp_obs_for_relative_action
         self.bimanual_contiguous_action = bimanual_contiguous_action
         self.action_normalizer_version = action_normalizer_version
+        self.artifact_manifest_raw = artifact_manifest_raw
+        self.artifact_manifest = artifact_manifest
         self.has_v2_action_contract = has_v2_action_contract
         self.allow_legacy_action_contract = allow_legacy_action_contract
         self.transforms = None

@@ -250,6 +250,19 @@ def build_normalizer_cache_signature(cfg: Any, dataset: Any, at_path: Path | Non
     }
 
 
+def normalizer_identity_digest(signature: Mapping[str, Any]) -> str:
+    """Hash the shared action-normalizer provenance, excluding LDP-only state."""
+    return stable_json_digest(
+        {
+            "schema_version": signature["schema_version"],
+            "dataset_digest": signature["dataset"]["digest"],
+            "split_digest": signature["split"]["digest"],
+            "action": signature["action"],
+            "normalizer": signature["normalizer"],
+        }
+    )
+
+
 def _metadata_path(normalizer_path: Path) -> Path:
     return Path(normalizer_path).with_name("normalizer.meta.json")
 
@@ -261,16 +274,28 @@ def load_normalizer_cache(normalizer_path: Path, signature: Mapping[str, Any]) -
     if not normalizer_path.is_file() or not metadata_path.is_file():
         return None
     try:
-        cached_signature = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if cached_signature != signature:
+    if not isinstance(metadata, Mapping) or metadata.get("signature") != signature:
         return None
-    with normalizer_path.open("rb") as file:
-        return pickle.load(file)
+    expected_sha256 = metadata.get("normalizer_sha256")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        return None
+    try:
+        actual_sha256 = sha256_file(normalizer_path)
+    except OSError:
+        return None
+    if actual_sha256 != expected_sha256:
+        return None
+    try:
+        with normalizer_path.open("rb") as file:
+            return pickle.load(file)
+    except (OSError, EOFError, pickle.UnpicklingError):
+        return None
 
 
-def _atomic_replace(path: Path, write) -> None:
+def _write_temporary(path: Path, write) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary_name)
@@ -279,6 +304,15 @@ def _atomic_replace(path: Path, write) -> None:
             write[2](file)
             file.flush()
             os.fsync(file.fileno())
+        return temporary_path
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_replace(path: Path, write) -> None:
+    temporary_path = _write_temporary(path, write)
+    try:
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -291,15 +325,27 @@ def save_normalizer_cache(
 ) -> None:
     """Atomically publish the pickle, then its exact-match metadata marker."""
     normalizer_path = Path(normalizer_path)
-    _atomic_replace(normalizer_path, ("wb", {}, lambda file: pickle.dump(normalizer, file)))
+    temporary_path = _write_temporary(
+        normalizer_path,
+        ("wb", {}, lambda file: pickle.dump(normalizer, file)),
+    )
+    try:
+        normalizer_sha256 = sha256_file(temporary_path)
+        os.replace(temporary_path, normalizer_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     metadata_path = _metadata_path(normalizer_path)
+    metadata = {
+        "signature": signature,
+        "normalizer_sha256": normalizer_sha256,
+    }
     _atomic_replace(
         metadata_path,
         (
             "w",
             {"encoding": "utf-8"},
             lambda file: json.dump(
-                signature,
+                metadata,
                 file,
                 sort_keys=True,
                 separators=(",", ":"),

@@ -420,7 +420,7 @@ def test_load_policy_strict_accepts_exact_v2_bundle(tmp_path, monkeypatch) -> No
     pca_path.write_bytes(b"PCA artifact")
     at_artifacts = artifact_manifest(pca_sha256=deploy.sha256_file(pca_path))
     ldp_artifacts = artifact_manifest(
-        normalizer_sha256="l" * 64,
+        normalizer_sha256="n" * 64,
         pca_sha256=deploy.sha256_file(pca_path),
         at_sha256=deploy.sha256_file(at_path),
         latent_target_mode="posterior_mode_post_vq",
@@ -449,6 +449,7 @@ def test_load_policy_strict_accepts_exact_v2_bundle(tmp_path, monkeypatch) -> No
     [
         ({"at_sha256": "x" * 64}, "AT"),
         ({"pca_sha256": "x" * 64}, "PCA"),
+        ({"normalizer_sha256": "x" * 64}, "normalizer"),
     ],
 )
 def test_load_policy_strict_rejects_same_dimension_different_artifact(
@@ -462,7 +463,7 @@ def test_load_policy_strict_rejects_same_dimension_different_artifact(
     at_artifacts = artifact_manifest(pca_sha256=pca_sha256)
     ldp_artifacts = artifact_manifest(
         **{
-            "normalizer_sha256": "l" * 64,
+            "normalizer_sha256": "n" * 64,
             "pca_sha256": pca_sha256,
             "at_sha256": deploy.sha256_file(at_path),
             "latent_target_mode": "posterior_mode_post_vq",

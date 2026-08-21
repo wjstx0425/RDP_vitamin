@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 import numpy as np
 import pytest
 import torch
 import torchvision
+import zarr
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
@@ -12,6 +14,9 @@ from convert_pick_tube_lerobot_to_rdp_zarr import (
     parse_dataset_repeats,
 )
 from reactive_diffusion_policy.common.replay_buffer import ReplayBuffer
+from reactive_diffusion_policy.common.artifact_manifest import (
+    build_normalizer_cache_signature,
+)
 from reactive_diffusion_policy.common.sampler import SequenceSampler
 from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
 from reactive_diffusion_policy.model.vision.multi_image_obs_encoder import TrainOnlyTransform
@@ -137,6 +142,50 @@ def test_dataset_exposes_v2_masks_at_top_level(tmp_path):
     torch.testing.assert_close(
         sample["idle_arm_mask"], torch.tensor([[True, False], [False, False]])
     )
+
+
+@pytest.mark.parametrize("load_to_memory", [False, True])
+def test_dataset_persists_v2_manifest_for_artifact_signatures(
+    tmp_path, load_to_memory
+):
+    dataset_path = tmp_path / f"v2-manifest-{load_to_memory}"
+    _write_minimal_action_dataset(dataset_path, include_v2_arrays=True)
+    manifest = {
+        "action_representation_version": 2,
+        "action_contract": "bimanual_relative_pose20d_v2",
+        "normalizer_version": "zero_centered_v2",
+        "dataset_digest": "d" * 64,
+        "pca_sha256": "p" * 64,
+        "tactile_cache_sha256": "t" * 64,
+        "converter_git_commit": "converter-commit",
+    }
+    raw_manifest = json.dumps(manifest, sort_keys=True)
+    root = zarr.open_group(str(dataset_path / "replay_buffer.zarr"), mode="a")
+    root["meta"].attrs["v2_manifest_json"] = raw_manifest
+
+    dataset = _minimal_dataset(
+        dataset_path,
+        load_to_memory=load_to_memory,
+        action_normalizer_version="zero_centered_v2",
+    )
+    cfg = OmegaConf.create(
+        {
+            "artifact_git_commit": "training-commit",
+            "task": {
+                "dataset": {
+                    "action_normalizer_version": "zero_centered_v2",
+                    "seed": 42,
+                    "val_ratio": 0.0,
+                    "max_train_episodes": None,
+                }
+            },
+        }
+    )
+
+    assert dataset.artifact_manifest_raw == raw_manifest
+    assert dataset.artifact_manifest == manifest
+    signature = build_normalizer_cache_signature(cfg, dataset, None)
+    assert signature["dataset"]["digest"] == "d" * 64
 
 
 def test_dataset_requires_explicit_legacy_action_contract_opt_in(tmp_path):
