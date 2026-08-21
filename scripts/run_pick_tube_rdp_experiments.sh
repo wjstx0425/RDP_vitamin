@@ -21,6 +21,7 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 EXPERIMENT_ID=${EXPERIMENT_ID:-$(date +%Y%m%d_%H%M%S)}
 DRY_RUN=${DRY_RUN:-0}
 FORCE_PREPARE=${FORCE_PREPARE:-0}
+BASELINE_JSON=${BASELINE_JSON:-}
 
 # The six pick-tube datasets. Override only when intentionally preparing a
 # different six-dataset cohort.
@@ -61,6 +62,7 @@ Common overrides:
   DATASET30_PATH=/absolute/path/to/existing-pca30-rdp-zarr
   # PCA16_PATH/PCA60_PATH and DATASET16_PATH/DATASET60_PATH are also supported.
   EXPERIMENT_ID=my_run
+  BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json
   FORCE_PREPARE=1   # refit PCA and replace existing matching Zarr targets
   DRY_RUN=1         # print training commands; data preparation is also skipped
 
@@ -81,6 +83,17 @@ run() {
 check_python() {
   if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python environment not found: ${PYTHON_BIN}" >&2
+    exit 1
+  fi
+}
+
+check_baseline_json() {
+  if [[ -z "${BASELINE_JSON}" ]]; then
+    echo "BASELINE_JSON is required for pick-tube v2 training." >&2
+    exit 2
+  fi
+  if [[ ! -f "${BASELINE_JSON}" ]]; then
+    echo "Validation baseline JSON not found: ${BASELINE_JSON}" >&2
     exit 1
   fi
 }
@@ -194,8 +207,9 @@ train_current_ldp20() {
     "GPU_ID=${GPU_ID}" \
     "LOGGING_MODE=${LOGGING_MODE}" \
     "MIXED_PRECISION=${MIXED_PRECISION}" \
+    "BASELINE_JSON=${BASELINE_JSON}" \
     "TACTILE_DIM=30" \
-    "LDP_EPOCH=15" \
+    "LDP_EPOCHS=20" \
     "LDP_BATCH=${LDP_BATCH}" \
     "NUM_WORKERS=${NUM_WORKERS}" \
     "LDP_CHECKPOINT_EVERY=2" \
@@ -218,6 +232,7 @@ train_six_dimension() {
     "GPU_ID=${GPU_ID}" \
     "LOGGING_MODE=${LOGGING_MODE}" \
     "MIXED_PRECISION=${MIXED_PRECISION}" \
+    "BASELINE_JSON=${BASELINE_JSON}" \
     "TACTILE_DIM=${tactile_dim}" \
     "AT_EPOCHS=20" \
     "LDP_EPOCHS=20" \
@@ -234,11 +249,15 @@ train_six_dimension() {
 
 case "${STAGE}" in
   current-ldp20)
+    check_baseline_json
     check_python
     ;;
   prepare6|six30|six16|six60|all)
     check_python
     check_six_dataset_inputs
+    if [[ "${STAGE}" != "prepare6" ]]; then
+      check_baseline_json
+    fi
     ;;
   -h|--help|help)
     usage

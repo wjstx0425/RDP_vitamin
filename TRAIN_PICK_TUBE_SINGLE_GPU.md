@@ -42,9 +42,19 @@ bash scripts/setup_pick_tube_data.sh convert
 
 ## 3. 单卡完整训练
 
+训练前必须提供冻结 v1 验证结果 JSON；两个值必须来自实测，不能混合单位：
+
+```text
+{
+  "val_active_left_translation_mae_mm": <measured-positive-number>,
+  "val_active_left_rotation_mae_deg": <measured-positive-number>
+}
+```
+
 ```bash
 GPU_ID=0 \
 RUN_ID=pca30_latent32_full6_v1 \
+BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json \
 AT_EPOCHS=20 \
 LDP_EPOCHS=10 \
 AT_BATCH=64 \
@@ -78,6 +88,7 @@ data/outputs/pick_tube_01_06/
 ```bash
 GPU_ID=0 \
 RUN_ID=pca30_latent32_full6_v1 \
+BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json \
 AT_CKPT=/absolute/path/to/at/checkpoints/latest.ckpt \
 bash scripts/train_pick_tube_single_gpu.sh ldp
 ```
@@ -86,6 +97,6 @@ bash scripts/train_pick_tube_single_gpu.sh ldp
 
 ```bash
 DRY_RUN=1 RUN_ID=pca30_latent32_full6_v1 \
+BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json \
 bash scripts/train_pick_tube_single_gpu.sh all
 ```
-

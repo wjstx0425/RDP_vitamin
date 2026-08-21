@@ -313,7 +313,7 @@ class VAE:
         temporal_cond = torch.cat(temporal_cond, dim=-1)
         return temporal_cond
 
-    def compute_loss_and_metric(self, batch):
+    def compute_loss_and_metric(self, batch, *, sample_posterior: bool = True):
 
         normalized_action = self.normalizer['action'].normalize(batch["action"])
         state = self.preprocess(normalized_action / self.act_scale)
@@ -322,7 +322,10 @@ class VAE:
         if self.use_vq:
             state_vq, vq_code, vq_loss_state = self.quant_state_with_vq(state_rep)
         else:
-            state_vq, posterior = self.quant_state_without_vq(state_rep)
+            state_vq, posterior = self.quant_state_without_vq(
+                state_rep,
+                sample=sample_posterior,
+            )
             state_vq = self.postprocess_quant_state_without_vq(state_vq)
 
         if self.use_rnn_decoder:
@@ -379,6 +382,8 @@ class VAE:
             return_dict["loss"] = rep_loss
             return_dict.update({
                 "kl_loss": kl_loss.clone().detach().cpu().numpy(),
+                "posterior_mean": posterior.mean.detach().mean().cpu().item(),
+                "posterior_std": posterior.std.detach().mean().cpu().item(),
                 "rep_loss": rep_loss.clone().detach().cpu().numpy(),
             })
 

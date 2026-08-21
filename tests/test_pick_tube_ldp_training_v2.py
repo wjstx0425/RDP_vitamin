@@ -101,6 +101,22 @@ def test_non_vq_posterior_sampling_remains_the_default():
     assert sample_parameter.default is True
 
 
+def test_at_validation_posterior_mode_is_deterministic_and_reports_statistics():
+    at = _make_at()
+    normalizer = LinearNormalizer()
+    normalizer["action"] = SingleFieldLinearNormalizer.create_identity()
+    at.set_normalizer(normalizer)
+    batch = {"action": torch.randn(3, 4, 2), "extended_obs": {}}
+
+    first = at.compute_loss_and_metric(batch, sample_posterior=False)
+    second = at.compute_loss_and_metric(batch, sample_posterior=False)
+
+    torch.testing.assert_close(first["loss"], second["loss"], rtol=0, atol=0)
+    assert first["posterior_mean"] == second["posterior_mean"]
+    assert first["posterior_std"] == second["posterior_std"]
+    assert first["posterior_std"] > 0
+
+
 def test_ldp_latent_target_encoding_is_deterministic_and_detached():
     policy = _make_policy()
     actions = torch.randn(3, 4, 2)
@@ -129,6 +145,23 @@ def test_ldp_backward_leaves_action_tokenizer_gradients_none():
     policy.compute_loss(batch).backward()
 
     assert all(parameter.grad is None for parameter in _at_parameters(policy.at))
+
+
+def test_ldp_compute_loss_accepts_full_v2_dataset_batch():
+    policy = _make_policy()
+    batch = {
+        "obs": {"state": torch.randn(2, 1, 3)},
+        "action": torch.randn(2, 4, 2),
+        "extended_obs": {},
+        "valid_mask": torch.tensor(
+            [[True, True, True, False], [True, True, False, False]]
+        ),
+        "idle_arm_mask": torch.zeros((2, 4, 2), dtype=torch.bool),
+    }
+
+    loss = policy.compute_loss(batch)
+
+    assert torch.isfinite(loss)
 
 
 def test_ldp_train_keeps_action_tokenizer_in_eval_mode():

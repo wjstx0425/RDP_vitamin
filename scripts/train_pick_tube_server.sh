@@ -15,6 +15,7 @@ RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
 LOGGING_MODE=${LOGGING_MODE:-offline}
 DRY_RUN=${DRY_RUN:-0}
 MASTER_PORT=${MASTER_PORT:-29500}
+BASELINE_JSON=${BASELINE_JSON:-}
 
 usage() {
   cat <<USAGE
@@ -27,7 +28,8 @@ Examples:
 
 AT is single-GPU. The rtxpro6000x2 profile uses both GPUs only for LDP.
 Common overrides: GPU_IDS, DATASET_PATH, OUTPUT_ROOT, AT_CKPT,
-AT_BATCH, LDP_BATCH, AT_EPOCHS, LDP_EPOCHS, NUM_WORKERS, LOGGING_MODE.
+AT_BATCH, LDP_BATCH, AT_EPOCHS, LDP_EPOCHS, NUM_WORKERS, LOGGING_MODE,
+BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json.
 Use DRY_RUN=1 to print commands without training.
 USAGE
 }
@@ -76,6 +78,17 @@ require_data() {
   fi
 }
 
+require_baseline() {
+  if [[ -z "${BASELINE_JSON}" ]]; then
+    echo "BASELINE_JSON is required for pick-tube v2 training." >&2
+    exit 2
+  fi
+  if [[ ! -f "${BASELINE_JSON}" ]]; then
+    echo "Validation baseline JSON not found: ${BASELINE_JSON}" >&2
+    exit 1
+  fi
+}
+
 train_at() {
   local debug=$1
   local at_gpu=${GPU_IDS%%,*}
@@ -90,6 +103,7 @@ train_at() {
     "val_dataloader.batch_size=${AT_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"
     "val_dataloader.num_workers=${NUM_WORKERS}"
+    "validation.baseline_json=${BASELINE_JSON}"
   )
   if [[ "${debug}" == "1" ]]; then
     args+=(training.debug=true task.dataset.max_train_episodes=1)
@@ -151,6 +165,7 @@ train_ldp() {
     "val_dataloader.batch_size=${LDP_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"
     "val_dataloader.num_workers=${NUM_WORKERS}"
+    "validation.baseline_json=${BASELINE_JSON}"
   )
   if [[ "${debug}" == "1" ]]; then
     args+=(training.debug=true task.dataset.max_train_episodes=1)
@@ -161,19 +176,23 @@ train_ldp() {
 
 case "${STAGE}" in
   at)
+    require_baseline
     require_data
     train_at 0
     ;;
   ldp)
+    require_baseline
     require_data
     train_ldp 0
     ;;
   all)
+    require_baseline
     require_data
     train_at 0
     train_ldp 0
     ;;
   smoke)
+    require_baseline
     require_data
     AT_DIR=${AT_DIR}_smoke
     LDP_DIR=${LDP_DIR}_smoke

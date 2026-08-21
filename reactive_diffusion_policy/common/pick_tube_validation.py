@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import json
 import math
+from pathlib import Path
+import random
 from collections.abc import Mapping, Sequence
 
 import einops
@@ -20,8 +24,8 @@ from reactive_diffusion_policy.common.pick_tube_action_contract import (
 
 
 _ARM_LAYOUT = {
-    "left": (slice(0, 3), slice(3, 9)),
-    "right": (slice(10, 13), slice(13, 19)),
+    "left": (slice(0, 3), slice(3, 9), 9),
+    "right": (slice(10, 13), slice(13, 19), 19),
 }
 
 
@@ -113,6 +117,30 @@ def _p95_or_nan(values: Sequence[float]) -> float:
     return float(np.percentile(values, 95)) if values else float("nan")
 
 
+def _p50_or_nan(values: Sequence[float]) -> float:
+    return float(np.percentile(values, 50)) if values else float("nan")
+
+
+@contextmanager
+def preserve_global_rng_state(seed: int):
+    """Run a deterministic validation sample without advancing global RNGs."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(int(seed))
+        np.random.seed(int(seed) % (2**32))
+        torch.manual_seed(int(seed))
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 def compute_idle_rollout_metrics(
     target,
     prediction,
@@ -172,12 +200,18 @@ def compute_idle_rollout_metrics(
     active_rotation: dict[str, list[float]] = {
         arm: [] for arm in _ARM_LAYOUT
     }
+    translation_bias = {
+        phase: {arm: [] for arm in _ARM_LAYOUT} for phase in ("idle", "active")
+    }
+    gripper_error = {
+        phase: {arm: [] for arm in _ARM_LAYOUT} for phase in ("idle", "active")
+    }
     micro_target_count = 0
     micro_predicted_count = 0
     predicted_micro_count = 0
     true_predicted_micro_count = 0
 
-    for arm_index, (arm, (position_slice, rotation_slice)) in enumerate(
+    for arm_index, (arm, (position_slice, rotation_slice, gripper_index)) in enumerate(
         _ARM_LAYOUT.items()
     ):
         for batch_index in range(target_array.shape[0]):
@@ -208,7 +242,14 @@ def compute_idle_rollout_metrics(
                 translation_error = float(
                     np.linalg.norm(predicted_position - target_position)
                 )
+                translation_error_vector = (
+                    predicted_position - target_position
+                ) * 1000.0
                 rotation_error = _geodesic_degrees(target_rotation, predicted_rotation)
+                width_error = abs(
+                    prediction_array[batch_index, time_index, gripper_index]
+                    - target_array[batch_index, time_index, gripper_index]
+                ) * 1000.0
                 if idle_array[batch_index, time_index, arm_index]:
                     has_idle = True
                     target_total_translation += target_position
@@ -219,9 +260,13 @@ def compute_idle_rollout_metrics(
                     )
                     idle_step_translation[arm].append(translation_error * 1000.0)
                     idle_step_rotation[arm].append(rotation_error)
+                    translation_bias["idle"][arm].append(translation_error_vector)
+                    gripper_error["idle"][arm].append(float(width_error))
                 else:
                     active_translation[arm].append(translation_error * 1000.0)
                     active_rotation[arm].append(rotation_error)
+                    translation_bias["active"][arm].append(translation_error_vector)
+                    gripper_error["active"][arm].append(float(width_error))
                     target_motion_translation = float(np.linalg.norm(target_position))
                     target_motion_rotation = _geodesic_degrees(
                         np.eye(3), target_rotation
@@ -316,50 +361,178 @@ def compute_idle_rollout_metrics(
                 ),
             }
         )
+        for phase, translations, rotations in (
+            ("idle", idle_step_translation, idle_step_rotation),
+            ("active", active_translation, active_rotation),
+        ):
+            biases = translation_bias[phase][arm]
+            mean_bias = (
+                np.mean(np.stack(biases), axis=0)
+                if biases
+                else np.full(3, np.nan)
+            )
+            metrics.update(
+                {
+                    f"val_{phase}_{arm}_translation_bias_x_mm": float(
+                        mean_bias[0]
+                    ),
+                    f"val_{phase}_{arm}_translation_bias_y_mm": float(
+                        mean_bias[1]
+                    ),
+                    f"val_{phase}_{arm}_translation_bias_z_mm": float(
+                        mean_bias[2]
+                    ),
+                    f"val_{phase}_{arm}_translation_mae_mm": _mean_or_nan(
+                        translations[arm]
+                    ),
+                    f"val_{phase}_{arm}_translation_p50_mm": _p50_or_nan(
+                        translations[arm]
+                    ),
+                    f"val_{phase}_{arm}_translation_p95_mm": _p95_or_nan(
+                        translations[arm]
+                    ),
+                    f"val_{phase}_{arm}_rotation_mae_deg": _mean_or_nan(
+                        rotations[arm]
+                    ),
+                    f"val_{phase}_{arm}_rotation_p50_deg": _p50_or_nan(
+                        rotations[arm]
+                    ),
+                    f"val_{phase}_{arm}_rotation_p95_deg": _p95_or_nan(
+                        rotations[arm]
+                    ),
+                    f"val_{phase}_{arm}_gripper_mae_mm": _mean_or_nan(
+                        gripper_error[phase][arm]
+                    ),
+                }
+            )
     metrics["val_active_translation_mae_mm"] = _mean_or_nan(
         sum(active_translation.values(), [])
     )
     metrics["val_active_rotation_mae_deg"] = _mean_or_nan(
         sum(active_rotation.values(), [])
     )
+    for phase, translations, rotations in (
+        ("idle", idle_step_translation, idle_step_rotation),
+        ("active", active_translation, active_rotation),
+    ):
+        all_biases = sum(translation_bias[phase].values(), [])
+        mean_bias = (
+            np.mean(np.stack(all_biases), axis=0)
+            if all_biases
+            else np.full(3, np.nan)
+        )
+        all_translations = sum(translations.values(), [])
+        all_rotations = sum(rotations.values(), [])
+        metrics.update(
+            {
+                f"val_{phase}_translation_bias_x_mm": float(mean_bias[0]),
+                f"val_{phase}_translation_bias_y_mm": float(mean_bias[1]),
+                f"val_{phase}_translation_bias_z_mm": float(mean_bias[2]),
+                f"val_{phase}_translation_mae_mm": _mean_or_nan(all_translations),
+                f"val_{phase}_translation_p50_mm": _p50_or_nan(all_translations),
+                f"val_{phase}_translation_p95_mm": _p95_or_nan(all_translations),
+                f"val_{phase}_rotation_mae_deg": _mean_or_nan(all_rotations),
+                f"val_{phase}_rotation_p50_deg": _p50_or_nan(all_rotations),
+                f"val_{phase}_rotation_p95_deg": _p95_or_nan(all_rotations),
+                f"val_{phase}_gripper_mae_mm": _mean_or_nan(
+                    sum(gripper_error[phase].values(), [])
+                ),
+            }
+        )
     return metrics
+
+
+def compute_contiguous_300_step_drift(
+    target,
+    prediction,
+    idle_mask,
+    *,
+    valid_mask=None,
+) -> dict[str, float]:
+    """Measure drift from genuine contiguous 300-step action trajectories."""
+    target_array = _as_numpy(target)
+    if target_array.ndim < 2 or target_array.shape[-2] < 300:
+        raise ValueError("300 contiguous action steps are required for drift metrics")
+    metrics = compute_idle_rollout_metrics(
+        target,
+        prediction,
+        idle_mask,
+        horizon=300,
+        valid_mask=valid_mask,
+    )
+    result = {
+        "val_idle_translation_300_mm": metrics["val_idle_translation_29_mm"],
+        "val_idle_rotation_300_deg": metrics["val_idle_rotation_29_deg"],
+    }
+    for arm in _ARM_LAYOUT:
+        result[f"val_idle_{arm}_translation_300_mm"] = metrics[
+            f"val_idle_{arm}_translation_29_mm"
+        ]
+        result[f"val_idle_{arm}_rotation_300_deg"] = metrics[
+            f"val_idle_{arm}_rotation_29_deg"
+        ]
+    return result
 
 
 def evaluate_checkpoint_feasibility(
     *,
     idle_translation_29_mm: float,
     idle_rotation_29_deg: float,
-    active_metric: float,
-    active_baseline: float | None,
+    idle_translation_p95_mm: float,
+    idle_rotation_p95_deg: float,
+    active_translation_mm: float,
+    active_translation_baseline_mm: float | None,
+    active_rotation_deg: float,
+    active_rotation_baseline_deg: float | None,
     micro_motion_recall: float,
     max_active_degradation: float = 0.05,
     min_micro_motion_recall: float = 0.95,
 ) -> dict[str, float | bool]:
     """Apply hard gates and calculate the idle score used by top-k selection."""
     score = float(idle_translation_29_mm) + float(idle_rotation_29_deg) / 0.5
-    usable_baseline = (
-        active_baseline is not None
-        and math.isfinite(float(active_baseline))
-        and float(active_baseline) > 0
+    usable_translation_baseline = (
+        active_translation_baseline_mm is not None
+        and math.isfinite(float(active_translation_baseline_mm))
+        and float(active_translation_baseline_mm) > 0
     )
-    degradation = (
-        float(active_metric) / float(active_baseline) - 1.0
-        if usable_baseline
+    usable_rotation_baseline = (
+        active_rotation_baseline_deg is not None
+        and math.isfinite(float(active_rotation_baseline_deg))
+        and float(active_rotation_baseline_deg) > 0
+    )
+    translation_degradation = (
+        float(active_translation_mm) / float(active_translation_baseline_mm) - 1.0
+        if usable_translation_baseline
+        else float("inf")
+    )
+    rotation_degradation = (
+        float(active_rotation_deg) / float(active_rotation_baseline_deg) - 1.0
+        if usable_rotation_baseline
         else float("inf")
     )
     feasible = bool(
-        usable_baseline
+        usable_translation_baseline
+        and usable_rotation_baseline
         and math.isfinite(score)
         and math.isfinite(float(micro_motion_recall))
-        and degradation <= float(max_active_degradation) + 1e-12
+        and translation_degradation <= float(max_active_degradation) + 1e-12
+        and rotation_degradation <= float(max_active_degradation) + 1e-12
         and float(micro_motion_recall) >= float(min_micro_motion_recall)
     )
+    deployable = bool(
+        feasible
+        and float(idle_translation_29_mm) < 1.0
+        and float(idle_rotation_29_deg) < 0.5
+        and float(idle_translation_p95_mm) < 0.05
+        and float(idle_rotation_p95_deg) < 0.03
+    )
     return {
-        "val_active_degradation": degradation,
+        "val_active_translation_degradation": translation_degradation,
+        "val_active_rotation_degradation": rotation_degradation,
         "val_micro_motion_recall": float(micro_motion_recall),
         "val_idle_score": score,
         "val_checkpoint_feasible": feasible,
-        "val_deployable": feasible,
+        "val_deployable": deployable,
     }
 
 
@@ -372,6 +545,45 @@ def _select(config, key: str):
             return None
         current = current[part]
     return current
+
+
+def load_active_metric_baselines(config) -> dict[str, float] | None:
+    """Load separate frozen-v1 active metrics required by v2 training."""
+    action_version = _select(config, "task.action_representation_version")
+    baseline_path = _select(config, "validation.baseline_json")
+    if action_version != 2 and not baseline_path:
+        return None
+    if not baseline_path:
+        raise ValueError(
+            "pick-tube v2 training requires validation.baseline_json before training"
+        )
+    path = Path(str(baseline_path)).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"validation baseline_json does not exist: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"validation baseline_json is invalid JSON: {path}") from error
+    if not isinstance(value, Mapping):
+        raise ValueError("validation baseline_json must contain a JSON object")
+    required = {
+        "translation_mm": "val_active_left_translation_mae_mm",
+        "rotation_deg": "val_active_left_rotation_mae_deg",
+    }
+    baselines: dict[str, float] = {}
+    for output_key, input_key in required.items():
+        raw = value.get(input_key)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(
+                f"validation baseline_json field {input_key!r} must be a number"
+            )
+        baseline = float(raw)
+        if not math.isfinite(baseline) or baseline <= 0:
+            raise ValueError(
+                f"validation baseline_json field {input_key!r} must be finite and positive"
+            )
+        baselines[output_key] = baseline
+    return baselines
 
 
 def _action_contract_identity(config) -> tuple[object, object]:

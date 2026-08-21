@@ -66,13 +66,20 @@ class BaseWorkspace:
         """
         pass
 
-    def bind_checkpoint_artifacts(self, signature, *, normalizer_path, role):
+    def bind_checkpoint_artifacts(
+        self,
+        signature,
+        *,
+        normalizer,
+        normalizer_path,
+        role,
+    ):
         """Bind the training inputs that this checkpoint is safe to use with."""
         if not pathlib.Path(normalizer_path).is_file():
             raise FileNotFoundError(f"normalizer cache does not exist: {normalizer_path}")
         manifest = ArtifactManifest.from_cache_signature(
             signature,
-            normalizer_sha256=normalizer_identity_digest(signature),
+            normalizer_sha256=normalizer_identity_digest(normalizer),
             role=role,
         )
         OmegaConf.update(

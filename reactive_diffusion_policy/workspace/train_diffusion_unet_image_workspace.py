@@ -36,6 +36,8 @@ from reactive_diffusion_policy.common.artifact_manifest import (
 from reactive_diffusion_policy.common.pick_tube_validation import (
     compute_idle_rollout_metrics,
     evaluate_checkpoint_feasibility,
+    load_active_metric_baselines,
+    preserve_global_rng_state,
     validate_resume_action_contract,
 )
 from accelerate import Accelerator
@@ -143,6 +145,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.val_every = 1
             cfg.training.sample_every = 1
 
+        active_baselines = load_active_metric_baselines(cfg)
+
         accelerator = Accelerator(
             log_with='wandb',
             kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
@@ -213,6 +217,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             raise RuntimeError("normalizer cache was not published by the main process")
         self.bind_checkpoint_artifacts(
             normalizer_signature,
+            normalizer=normalizer,
             normalizer_path=normalizer_path,
             role="LDP",
         )
@@ -382,44 +387,72 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         val_predictions = list()
                         val_idle_masks = list()
                         val_valid_masks = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
-                                leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                # Validate the same policy used for sampling and
-                                # deployment. In particular, when EMA is enabled,
-                                # using self.model here evaluates the non-EMA model
-                                # in train mode and keeps stochastic image
-                                # augmentation active.
-                                loss = policy(batch)
-                                val_losses.append(loss.detach())
-                                if 'latent' in cfg.name:
-                                    result = policy.predict_action(
-                                        batch["obs"],
-                                        extended_obs_dict=batch["extended_obs"],
-                                        dataset_obs_temporal_downsample_ratio=(
-                                            cfg.task.dataset.obs_temporal_downsample_ratio
-                                        ),
-                                    )
-                                else:
-                                    result = policy.predict_action(batch["obs"])
-                                val_targets.append(batch["action"].detach().cpu())
-                                val_predictions.append(
-                                    result["action_pred"].detach().cpu()
-                                )
-                                val_idle_masks.append(
-                                    batch["idle_arm_mask"].detach().cpu()
-                                )
-                                val_valid_masks.append(
-                                    batch["valid_mask"].detach().cpu()
-                                )
-                                if (cfg.training.max_val_steps is not None) \
-                                    and batch_idx >= (cfg.training.max_val_steps-1):
-                                    break
+                        validation_seeds = [
+                            int(seed) for seed in cfg.validation.get("seeds", [0])
+                        ]
+                        if not validation_seeds:
+                            raise ValueError("validation.seeds must not be empty")
+                        for validation_seed in validation_seeds:
+                            with preserve_global_rng_state(validation_seed):
+                                with tqdm.tqdm(
+                                    val_dataloader,
+                                    desc=(
+                                        f"Validation epoch {self.epoch} "
+                                        f"seed {validation_seed}"
+                                    ),
+                                    leave=False,
+                                    mininterval=cfg.training.tqdm_interval_sec,
+                                ) as tepoch:
+                                    for batch_idx, batch in enumerate(tepoch):
+                                        batch = dict_apply(
+                                            batch,
+                                            lambda x: x.to(
+                                                device, non_blocking=True
+                                            ),
+                                        )
+                                        # Validate the same policy used for
+                                        # sampling and deployment, including EMA.
+                                        loss = policy(batch)
+                                        val_losses.append(loss.detach())
+                                        if 'latent' in cfg.name:
+                                            result = policy.predict_action(
+                                                batch["obs"],
+                                                extended_obs_dict=batch[
+                                                    "extended_obs"
+                                                ],
+                                                dataset_obs_temporal_downsample_ratio=(
+                                                    cfg.task.dataset.obs_temporal_downsample_ratio
+                                                ),
+                                            )
+                                        else:
+                                            result = policy.predict_action(
+                                                batch["obs"]
+                                            )
+                                        val_targets.append(
+                                            batch["action"].detach().cpu()
+                                        )
+                                        val_predictions.append(
+                                            result["action_pred"].detach().cpu()
+                                        )
+                                        val_idle_masks.append(
+                                            batch["idle_arm_mask"].detach().cpu()
+                                        )
+                                        val_valid_masks.append(
+                                            batch["valid_mask"].detach().cpu()
+                                        )
+                                        if (
+                                            cfg.training.max_val_steps is not None
+                                            and batch_idx
+                                            >= cfg.training.max_val_steps - 1
+                                        ):
+                                            break
                         if len(val_losses) > 0:
                             val_loss = torch.stack(val_losses).mean().item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            step_log['val_validation_seed_count'] = len(
+                                validation_seeds
+                            )
                             physical_metrics = compute_idle_rollout_metrics(
                                 torch.cat(val_targets),
                                 torch.cat(val_predictions),
@@ -428,14 +461,6 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 valid_mask=torch.cat(val_valid_masks),
                             )
                             step_log.update(physical_metrics)
-                            active_metric = (
-                                physical_metrics[
-                                    "val_active_left_translation_mae_mm"
-                                ]
-                                + physical_metrics[
-                                    "val_active_left_rotation_mae_deg"
-                                ]
-                            )
                             step_log.update(
                                 evaluate_checkpoint_feasibility(
                                     idle_translation_29_mm=physical_metrics[
@@ -444,8 +469,28 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                     idle_rotation_29_deg=physical_metrics[
                                         "val_idle_rotation_29_deg"
                                     ],
-                                    active_metric=active_metric,
-                                    active_baseline=cfg.validation.active_left_baseline,
+                                    idle_translation_p95_mm=physical_metrics[
+                                        "val_idle_translation_p95_mm"
+                                    ],
+                                    idle_rotation_p95_deg=physical_metrics[
+                                        "val_idle_rotation_p95_deg"
+                                    ],
+                                    active_translation_mm=physical_metrics[
+                                        "val_active_left_translation_mae_mm"
+                                    ],
+                                    active_translation_baseline_mm=(
+                                        active_baselines["translation_mm"]
+                                        if active_baselines is not None
+                                        else None
+                                    ),
+                                    active_rotation_deg=physical_metrics[
+                                        "val_active_left_rotation_mae_deg"
+                                    ],
+                                    active_rotation_baseline_deg=(
+                                        active_baselines["rotation_deg"]
+                                        if active_baselines is not None
+                                        else None
+                                    ),
                                     micro_motion_recall=physical_metrics[
                                         "val_micro_motion_recall"
                                     ],

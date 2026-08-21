@@ -10,12 +10,23 @@ STAGE=${1:-all}
 TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 AT_OUTPUT_DIR=${AT_OUTPUT_DIR:-${OUTPUT_ROOT}/at_${TIMESTAMP}}
 LDP_OUTPUT_DIR=${LDP_OUTPUT_DIR:-${OUTPUT_ROOT}/ldp_${TIMESTAMP}}
+BASELINE_JSON=${BASELINE_JSON:-}
+
+if [[ -z "${BASELINE_JSON}" ]]; then
+  echo "BASELINE_JSON is required for pick-tube v2 training." >&2
+  exit 2
+fi
+if [[ ! -f "${BASELINE_JSON}" ]]; then
+  echo "Validation baseline JSON not found: ${BASELINE_JSON}" >&2
+  exit 1
+fi
 
 if [[ "${STAGE}" == "at" || "${STAGE}" == "all" ]]; then
   CUDA_VISIBLE_DEVICES=${GPU_ID} "${PYTHON_BIN}" train.py \
     --config-name=train_pick_tube_at_workspace \
     task.dataset_path="${DATASET_PATH}" \
     hydra.run.dir="${AT_OUTPUT_DIR}" \
+    validation.baseline_json="${BASELINE_JSON}" \
     logging.mode="${LOGGING_MODE}"
 fi
 
@@ -30,5 +41,6 @@ if [[ "${STAGE}" == "ldp" || "${STAGE}" == "all" ]]; then
     task.dataset_path="${DATASET_PATH}" \
     at_load_dir="${AT_LOAD_DIR}" \
     hydra.run.dir="${LDP_OUTPUT_DIR}" \
+    validation.baseline_json="${BASELINE_JSON}" \
     logging.mode="${LOGGING_MODE}"
 fi

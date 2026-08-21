@@ -30,6 +30,7 @@ LDP_CHECKPOINT_KEEP=${LDP_CHECKPOINT_KEEP:-1}
 RESUME=${RESUME:-true}
 VALIDATE_DATASET=${VALIDATE_DATASET:-1}
 DRY_RUN=${DRY_RUN:-0}
+BASELINE_JSON=${BASELINE_JSON:-}
 
 AT_DIR=${AT_DIR:-${OUTPUT_ROOT}/at_${RUN_ID}}
 LDP_DIR=${LDP_DIR:-${OUTPUT_ROOT}/ldp_${RUN_ID}}
@@ -65,6 +66,7 @@ Common environment overrides:
   AT_CHECKPOINT_EVERY=1 LDP_CHECKPOINT_EVERY=1
   AT_CHECKPOINT_KEEP=1 LDP_CHECKPOINT_KEEP=1
   RESUME=true VALIDATE_DATASET=1 LOGGING_MODE=offline
+  BASELINE_JSON=/absolute/path/to/frozen_v1_validation_metrics.json
   DRY_RUN=1                  # print commands without starting training
 USAGE
 }
@@ -114,6 +116,14 @@ for value_name in AT_CHECKPOINT_KEEP LDP_CHECKPOINT_KEEP; do
     exit 2
   fi
 done
+if [[ -z "${BASELINE_JSON}" ]]; then
+  echo "BASELINE_JSON is required for pick-tube v2 training." >&2
+  exit 2
+fi
+if [[ ! -f "${BASELINE_JSON}" ]]; then
+  echo "Validation baseline JSON not found: ${BASELINE_JSON}" >&2
+  exit 1
+fi
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Training Python not found: ${PYTHON_BIN}" >&2
@@ -177,6 +187,7 @@ train_at() {
     "val_dataloader.batch_size=${AT_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"
     "val_dataloader.num_workers=${NUM_WORKERS}"
+    "validation.baseline_json=${BASELINE_JSON}"
   )
   run env "CUDA_VISIBLE_DEVICES=${GPU_ID}" "${args[@]}"
 
@@ -235,6 +246,7 @@ train_ldp() {
     "val_dataloader.batch_size=${LDP_BATCH}"
     "dataloader.num_workers=${NUM_WORKERS}"
     "val_dataloader.num_workers=${NUM_WORKERS}"
+    "validation.baseline_json=${BASELINE_JSON}"
   )
   run env "CUDA_VISIBLE_DEVICES=${GPU_ID}" "${args[@]}"
   echo "LDP output: ${LDP_DIR}"

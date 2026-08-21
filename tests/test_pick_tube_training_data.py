@@ -18,7 +18,14 @@ from reactive_diffusion_policy.common.artifact_manifest import (
     build_normalizer_cache_signature,
 )
 from reactive_diffusion_policy.common.sampler import SequenceSampler
+from reactive_diffusion_policy.dataset.real_image_tactile_latent_diffusion_dataset import (
+    RealImageTactileLatentDiffusionDataset,
+)
 from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
+from reactive_diffusion_policy.model.common.normalizer import (
+    LinearNormalizer,
+    SingleFieldLinearNormalizer,
+)
 from reactive_diffusion_policy.model.vision.multi_image_obs_encoder import TrainOnlyTransform
 
 
@@ -86,6 +93,102 @@ def test_sequence_sampler_uses_canonical_noop_for_action_suffix():
     assert not sample["action_valid"][2:].any()
     assert not sample["idle_arm_mask"][2:].any()
     np.testing.assert_array_equal(sample["value"][2:], [[1], [1]])
+
+
+def test_sequence_sampler_uses_canonical_noop_for_action_prefix():
+    replay_buffer = ReplayBuffer.create_empty_numpy()
+    action = np.zeros((2, 20), dtype=np.float32)
+    action[:, 0] = [0.001, 0.002]
+    action[:, 3] = 1
+    action[:, 7] = 1
+    action[:, 9] = [0.02, 0.03]
+    action[:, 10] = [0.004, 0.005]
+    action[:, 13] = 1
+    action[:, 17] = 1
+    action[:, 19] = [0.03, 0.04]
+    replay_buffer.add_episode({"action": action})
+    sampler = SequenceSampler(
+        replay_buffer=replay_buffer,
+        sequence_length=4,
+        pad_before=2,
+        canonical_action_padding=True,
+    )
+
+    sample = sampler.sample_sequence(0)
+
+    np.testing.assert_allclose(sample["action"][:2, :3], 0.0)
+    np.testing.assert_allclose(
+        sample["action"][:2, 3:9], np.tile([1, 0, 0, 0, 1, 0], (2, 1))
+    )
+    np.testing.assert_allclose(sample["action"][:2, 9], 0.02)
+    np.testing.assert_allclose(sample["action"][:2, 10:13], 0.0)
+    np.testing.assert_allclose(
+        sample["action"][:2, 13:19], np.tile([1, 0, 0, 0, 1, 0], (2, 1))
+    )
+    np.testing.assert_allclose(sample["action"][:2, 19], 0.03)
+
+
+def test_latent_normalizer_uses_canonical_noop_for_both_padding_edges(monkeypatch):
+    replay_buffer = ReplayBuffer.create_empty_numpy()
+    action = np.zeros((2, 20), dtype=np.float32)
+    action[:, 0] = [0.001, 0.002]
+    action[:, 3] = 1
+    action[:, 7] = 1
+    action[:, 9] = [0.02, 0.03]
+    action[:, 10] = [0.004, 0.005]
+    action[:, 13] = 1
+    action[:, 17] = 1
+    action[:, 19] = [0.03, 0.04]
+    replay_buffer.add_episode({"action": action})
+
+    normalizer = LinearNormalizer()
+    normalizer["action"] = SingleFieldLinearNormalizer.create_identity()
+    monkeypatch.setattr(
+        RealImageTactileDataset,
+        "get_normalizer",
+        lambda self, **kwargs: normalizer,
+    )
+
+    class CaptureAT:
+        device = torch.device("cpu")
+        act_scale = 1.0
+        use_vq = True
+        use_conv_encoder = False
+
+        def preprocess(self, value):
+            self.actions = value.detach().clone()
+            return value.flatten(1)
+
+        def encoder(self, value):
+            return value
+
+    dataset = object.__new__(RealImageTactileLatentDiffusionDataset)
+    dataset.shape_meta = {"action": {"shape": [20]}}
+    dataset.replay_buffer = replay_buffer
+    dataset.sampler = SequenceSampler(
+        replay_buffer=replay_buffer,
+        sequence_length=4,
+        pad_before=2,
+        pad_after=2,
+        canonical_action_padding=True,
+    )
+    dataset.at = CaptureAT()
+    dataset.use_latent_action_before_vq = True
+    dataset.has_v2_action_contract = True
+
+    dataset.get_normalizer(latent_batch_size=64)
+
+    expected_prefix = np.zeros(20, dtype=np.float32)
+    expected_prefix[[3, 7, 13, 17]] = 1
+    expected_prefix[[9, 19]] = action[0, [9, 19]]
+    expected_suffix = expected_prefix.copy()
+    expected_suffix[[9, 19]] = action[-1, [9, 19]]
+    np.testing.assert_allclose(
+        dataset.at.actions[0, :2], np.tile(expected_prefix, (2, 1))
+    )
+    np.testing.assert_allclose(
+        dataset.at.actions[-1, 2:], np.tile(expected_suffix, (2, 1))
+    )
 
 
 def test_sequence_sampler_legacy_20d_action_padding_repeats_last_action():

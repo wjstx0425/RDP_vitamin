@@ -23,3 +23,7 @@ policy:
 training:
   num_epochs: 10
   checkpoint_every: 2
+
+validation:
+  baseline_json: null
+  seeds: ${eval:'list(range(20))'}

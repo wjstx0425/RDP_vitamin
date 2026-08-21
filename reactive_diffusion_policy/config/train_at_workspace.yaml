@@ -92,7 +92,8 @@ logging:
   group: null
 
 validation:
-  active_left_baseline: null
+  baseline_json: null
+  seeds: [0]
   max_active_degradation: 0.05
   min_micro_motion_recall: 0.95
 

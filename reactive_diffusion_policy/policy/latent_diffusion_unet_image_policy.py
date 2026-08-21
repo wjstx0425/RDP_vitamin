@@ -244,7 +244,6 @@ class LatentDiffusionUnetImagePolicy(DiffusionUnetImagePolicy):
     # ========= training  ============
     def compute_loss(self, batch):
         # normalize input
-        assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
 

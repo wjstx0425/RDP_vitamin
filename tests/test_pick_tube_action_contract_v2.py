@@ -5,6 +5,7 @@ import pyarrow as pa
 import pytest
 
 from convert_pick_tube_lerobot_to_rdp_zarr import (
+    append,
     build_v2_manifest,
     create_output,
     extract_float32_matrix,
@@ -151,8 +152,56 @@ def test_converter_v2_schema_and_manifest_are_json_serializable(tmp_path):
     assert manifest["arrays"]["action"]["shape"] == [0, 20]
     assert len(manifest["pca_sha256"]) == 64
     assert len(manifest["tactile_cache_sha256"]) == 64
+    assert len(manifest["canonical_action_sha256"]) == 64
+    assert len(manifest["source_action_sha256"]) == 64
     assert len(manifest["dataset_digest"]) == 64
     json.loads(root["meta"].attrs["v2_manifest_json"])
+
+
+def test_converter_dataset_digest_binds_canonical_and_source_action_bytes(tmp_path):
+    pca_path = tmp_path / "pca.npz"
+    pca_path.write_bytes(b"stable-pca")
+    tactile_path = tmp_path / "embeddings.npy"
+    tactile_path.write_bytes(b"stable-tactile")
+    _, arrays = create_output(tmp_path / "replay_buffer.zarr", tactile_embedding_dim=30)
+    action = np.zeros((1, 20), dtype=np.float32)
+    action[:, [3, 7, 13, 17]] = 1
+    append(arrays["action"], action)
+    append(arrays["action_raw"], action)
+
+    def manifest():
+        return build_v2_manifest(
+            arrays=arrays,
+            pca_path=pca_path,
+            tactile_cache_paths={"pick_tube_01": tactile_path},
+            tactile_embedding_dim=30,
+            episode_manifest=[
+                {
+                    "dataset": "pick_tube_01",
+                    "episode_index": 0,
+                    "length": 1,
+                    "repeat": 1,
+                }
+            ],
+            repair_counts={"terminal_actions": 1},
+            idle_coverage_by_source={"pick_tube_01": {"left": 1.0, "right": 1.0}},
+            git_commit="deadbeef",
+        )
+
+    original = manifest()
+    arrays["action"][0, 0] = 0.001
+    canonical_changed = manifest()
+    arrays["action_raw"][0, 10] = 0.002
+    source_changed = manifest()
+
+    assert canonical_changed["canonical_action_sha256"] != original[
+        "canonical_action_sha256"
+    ]
+    assert canonical_changed["dataset_digest"] != original["dataset_digest"]
+    assert source_changed["source_action_sha256"] != canonical_changed[
+        "source_action_sha256"
+    ]
+    assert source_changed["dataset_digest"] != canonical_changed["dataset_digest"]
 
 
 def test_converter_extracts_float32_actions_without_value_coercion():

@@ -35,6 +35,7 @@ from reactive_diffusion_policy.common.artifact_manifest import (
 from reactive_diffusion_policy.common.pick_tube_validation import (
     compute_idle_rollout_metrics,
     evaluate_checkpoint_feasibility,
+    load_active_metric_baselines,
     reconstruct_at_actions,
     validate_resume_action_contract,
 )
@@ -123,6 +124,8 @@ class TrainATWorkspace(BaseWorkspace):
             cfg.training.checkpoint_every = 1
             cfg.training.val_every = 1
 
+        active_baselines = load_active_metric_baselines(cfg)
+
         # resume training
         resumed = False
         resumed_optimizer_step = False
@@ -162,6 +165,7 @@ class TrainATWorkspace(BaseWorkspace):
             print(f"Reusing normalizer from {normalizer_path}")
         self.bind_checkpoint_artifacts(
             normalizer_signature,
+            normalizer=normalizer,
             normalizer_path=normalizer_path,
             role="AT",
         )
@@ -338,6 +342,8 @@ class TrainATWorkspace(BaseWorkspace):
                         val_kl_loss = list()
                         val_encoder_loss = list()
                         val_vae_recon_loss = list()
+                        val_posterior_mean = list()
+                        val_posterior_std = list()
                         val_targets = list()
                         val_predictions = list()
                         val_idle_masks = list()
@@ -347,7 +353,10 @@ class TrainATWorkspace(BaseWorkspace):
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
-                                    loss_metric_dict = self.model.compute_loss_and_metric(batch)
+                                    loss_metric_dict = self.model.compute_loss_and_metric(
+                                        batch,
+                                        sample_posterior=False,
+                                    )
                                     physical_prediction = reconstruct_at_actions(
                                         policy, batch
                                     )
@@ -374,6 +383,13 @@ class TrainATWorkspace(BaseWorkspace):
                                     val_vq_loss_state.append(loss_metric_dict["vq_loss_state"])
                                 if "kl_loss" in loss_metric_dict:
                                     val_kl_loss.append(loss_metric_dict["kl_loss"])
+                                if "posterior_mean" in loss_metric_dict:
+                                    val_posterior_mean.append(
+                                        loss_metric_dict["posterior_mean"]
+                                    )
+                                    val_posterior_std.append(
+                                        loss_metric_dict["posterior_std"]
+                                    )
                                 if (cfg.training.max_val_steps is not None) \
                                         and batch_idx >= (cfg.training.max_val_steps - 1):
                                     break
@@ -391,6 +407,13 @@ class TrainATWorkspace(BaseWorkspace):
                                 step_log['val_vq_loss_state'] = np.mean(val_vq_loss_state)
                             if len(val_kl_loss) > 0:
                                 step_log['val_kl_loss'] = np.mean(val_kl_loss)
+                            if len(val_posterior_mean) > 0:
+                                step_log['val_posterior_mean'] = np.mean(
+                                    val_posterior_mean
+                                )
+                                step_log['val_posterior_std'] = np.mean(
+                                    val_posterior_std
+                                )
                             physical_metrics = compute_idle_rollout_metrics(
                                 torch.cat(val_targets),
                                 torch.cat(val_predictions),
@@ -399,14 +422,6 @@ class TrainATWorkspace(BaseWorkspace):
                                 valid_mask=torch.cat(val_valid_masks),
                             )
                             step_log.update(physical_metrics)
-                            active_metric = (
-                                physical_metrics[
-                                    "val_active_left_translation_mae_mm"
-                                ]
-                                + physical_metrics[
-                                    "val_active_left_rotation_mae_deg"
-                                ]
-                            )
                             step_log.update(
                                 evaluate_checkpoint_feasibility(
                                     idle_translation_29_mm=physical_metrics[
@@ -415,8 +430,28 @@ class TrainATWorkspace(BaseWorkspace):
                                     idle_rotation_29_deg=physical_metrics[
                                         "val_idle_rotation_29_deg"
                                     ],
-                                    active_metric=active_metric,
-                                    active_baseline=cfg.validation.active_left_baseline,
+                                    idle_translation_p95_mm=physical_metrics[
+                                        "val_idle_translation_p95_mm"
+                                    ],
+                                    idle_rotation_p95_deg=physical_metrics[
+                                        "val_idle_rotation_p95_deg"
+                                    ],
+                                    active_translation_mm=physical_metrics[
+                                        "val_active_left_translation_mae_mm"
+                                    ],
+                                    active_translation_baseline_mm=(
+                                        active_baselines["translation_mm"]
+                                        if active_baselines is not None
+                                        else None
+                                    ),
+                                    active_rotation_deg=physical_metrics[
+                                        "val_active_left_rotation_mae_deg"
+                                    ],
+                                    active_rotation_baseline_deg=(
+                                        active_baselines["rotation_deg"]
+                                        if active_baselines is not None
+                                        else None
+                                    ),
                                     micro_motion_recall=physical_metrics[
                                         "val_micro_motion_recall"
                                     ],

@@ -9,6 +9,10 @@ defaults:
 training:
   num_epochs: 20
 
+validation:
+  baseline_json: null
+  seeds: ${eval:'list(range(20))'}
+
 policy:
   action_loss_version: ${at.policy.action_loss_version}
   position_scale: ${at.policy.position_scale}

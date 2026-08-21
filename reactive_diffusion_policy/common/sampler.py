@@ -4,17 +4,17 @@ import numba
 from reactive_diffusion_policy.common.replay_buffer import ReplayBuffer
 
 
-def _canonical_action_suffix_value(last_action: np.ndarray) -> np.ndarray:
-    """Create a pick-tube 20D relative no-op from the final action widths."""
-    if last_action.shape != (20,):
-        return last_action
-    noop = np.zeros_like(last_action)
+def canonical_action_padding_value(edge_action: np.ndarray) -> np.ndarray:
+    """Create a pick-tube 20D relative no-op holding the edge gripper widths."""
+    if edge_action.shape != (20,):
+        return edge_action
+    noop = np.zeros_like(edge_action)
     noop[3] = 1
     noop[7] = 1
-    noop[9] = last_action[9]
+    noop[9] = edge_action[9]
     noop[13] = 1
     noop[17] = 1
-    noop[19] = last_action[19]
+    noop[19] = edge_action[19]
     return noop
 
 
@@ -191,11 +191,13 @@ class SequenceSampler:
                     shape=(self.sequence_length,) + input_arr.shape[1:],
                     dtype=input_arr.dtype)
                 if sample_start_idx > 0:
-                    if key not in ("action_valid", "idle_arm_mask"):
+                    if key == "action" and self.canonical_action_padding:
+                        data[:sample_start_idx] = canonical_action_padding_value(sample[0])
+                    elif key not in ("action_valid", "idle_arm_mask"):
                         data[:sample_start_idx] = sample[0]
                 if sample_end_idx < self.sequence_length:
                     if key == "action" and self.canonical_action_padding:
-                        data[sample_end_idx:] = _canonical_action_suffix_value(sample[-1])
+                        data[sample_end_idx:] = canonical_action_padding_value(sample[-1])
                     elif key not in ("action_valid", "idle_arm_mask"):
                         data[sample_end_idx:] = sample[-1]
                 data[sample_start_idx:sample_end_idx] = sample

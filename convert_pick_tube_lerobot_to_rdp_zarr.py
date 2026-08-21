@@ -201,6 +201,18 @@ def stable_json_sha256(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def sha256_array_content(array: zarr.Array) -> str:
+    """Hash array metadata and canonical C-order content in bounded chunks."""
+    digest = hashlib.sha256()
+    digest.update(str(np.dtype(array.dtype)).encode("ascii"))
+    digest.update(stable_json_sha256(list(array.shape)).encode("ascii"))
+    chunk_rows = max(1, int(array.chunks[0]))
+    for start in range(0, int(array.shape[0]), chunk_rows):
+        values = np.asarray(array[start : start + chunk_rows])
+        digest.update(np.ascontiguousarray(values).tobytes(order="C"))
+    return digest.hexdigest()
+
+
 def converter_git_commit() -> str:
     try:
         result = subprocess.run(
@@ -227,6 +239,15 @@ def build_v2_manifest(
     git_commit: str,
 ) -> dict:
     """Build the JSON-serializable audit manifest for a completed conversion."""
+    canonical_action_sha256 = sha256_array_content(arrays["action"])
+    source_action_sha256 = sha256_array_content(arrays["action_raw"])
+    dataset_digest = stable_json_sha256(
+        {
+            "source_episodes": episode_manifest,
+            "canonical_action_sha256": canonical_action_sha256,
+            "source_action_sha256": source_action_sha256,
+        }
+    )
     return {
         "action_representation_version": ACTION_REPRESENTATION_VERSION,
         "action_contract": ACTION_CONTRACT,
@@ -262,7 +283,9 @@ def build_v2_manifest(
         "pca_output_dim": int(tactile_embedding_dim),
         "pca_sensor_to_arm_order": ["left", "right"],
         "source_episodes": episode_manifest,
-        "dataset_digest": stable_json_sha256(episode_manifest),
+        "canonical_action_sha256": canonical_action_sha256,
+        "source_action_sha256": source_action_sha256,
+        "dataset_digest": dataset_digest,
         "converter_git_commit": git_commit,
     }
 

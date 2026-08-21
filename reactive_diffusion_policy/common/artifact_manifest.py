@@ -13,6 +13,7 @@ import tempfile
 from typing import Any, Mapping
 
 import numpy as np
+import torch
 from omegaconf import OmegaConf
 
 
@@ -250,17 +251,33 @@ def build_normalizer_cache_signature(cfg: Any, dataset: Any, at_path: Path | Non
     }
 
 
-def normalizer_identity_digest(signature: Mapping[str, Any]) -> str:
-    """Hash the shared action-normalizer provenance, excluding LDP-only state."""
-    return stable_json_digest(
-        {
-            "schema_version": signature["schema_version"],
-            "dataset_digest": signature["dataset"]["digest"],
-            "split_digest": signature["split"]["digest"],
-            "action": signature["action"],
-            "normalizer": signature["normalizer"],
+def normalizer_identity_digest(normalizer: Any) -> str:
+    """Hash actual shared action-normalizer parameters, excluding latent state."""
+    try:
+        action_state = normalizer["action"].state_dict()
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError("normalizer is missing action parameters") from error
+    if not action_state:
+        raise ValueError("normalizer action parameters must not be empty")
+    digest = hashlib.sha256()
+    for key in sorted(action_state):
+        value = action_state[key]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"normalizer action parameter {key!r} is not a tensor")
+        tensor = value.detach().cpu().contiguous()
+        array = tensor.numpy()
+        metadata = {
+            "key": key,
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
         }
-    )
+        digest.update(
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _metadata_path(normalizer_path: Path) -> Path:
@@ -288,11 +305,21 @@ def load_normalizer_cache(normalizer_path: Path, signature: Mapping[str, Any]) -
         return None
     if actual_sha256 != expected_sha256:
         return None
+    expected_action_sha256 = metadata.get("action_normalizer_sha256")
+    if not isinstance(expected_action_sha256, str) or len(expected_action_sha256) != 64:
+        return None
     try:
         with normalizer_path.open("rb") as file:
-            return pickle.load(file)
+            normalizer = pickle.load(file)
     except (OSError, EOFError, pickle.UnpicklingError):
         return None
+    try:
+        actual_action_sha256 = normalizer_identity_digest(normalizer)
+    except ValueError:
+        return None
+    if actual_action_sha256 != expected_action_sha256:
+        return None
+    return normalizer
 
 
 def _write_temporary(path: Path, write) -> Path:
@@ -338,6 +365,7 @@ def save_normalizer_cache(
     metadata = {
         "signature": signature,
         "normalizer_sha256": normalizer_sha256,
+        "action_normalizer_sha256": normalizer_identity_digest(normalizer),
     }
     _atomic_replace(
         metadata_path,

@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import tqdm
 from reactive_diffusion_policy.model.vae.model import VAE
+from reactive_diffusion_policy.common.sampler import canonical_action_padding_value
 from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
 from reactive_diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 
@@ -40,9 +41,15 @@ class RealImageTactileLatentDiffusionDataset(RealImageTactileDataset):
                 sample = action_data[buffer_start:buffer_end]
                 actions[batch_idx, sample_start:sample_end] = sample
                 if sample_start > 0:
-                    actions[batch_idx, :sample_start] = sample[0]
+                    prefix = sample[0]
+                    if self.has_v2_action_contract:
+                        prefix = canonical_action_padding_value(prefix)
+                    actions[batch_idx, :sample_start] = prefix
                 if sample_end < sequence_length:
-                    actions[batch_idx, sample_end:] = sample[-1]
+                    suffix = sample[-1]
+                    if self.has_v2_action_contract:
+                        suffix = canonical_action_padding_value(suffix)
+                    actions[batch_idx, sample_end:] = suffix
 
             action = torch.from_numpy(actions).to(self.at.device)
             action = normalizer['action'].normalize(action)

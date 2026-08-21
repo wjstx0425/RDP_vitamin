@@ -1,15 +1,21 @@
+import json
 import math
+import random
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from reactive_diffusion_policy.common.pick_tube_validation import (
     build_episode_split_manifest,
+    compute_contiguous_300_step_drift,
     compute_idle_rollout_metrics,
     evaluate_checkpoint_feasibility,
+    load_active_metric_baselines,
+    preserve_global_rng_state,
     validate_resume_action_contract,
 )
 
@@ -74,45 +80,151 @@ def test_metrics_report_active_errors_and_micro_motion_recall():
     target[..., 0] = 0.0006
     prediction[:, :3, 0] = 0.0006
     prediction[:, 3, 0] = 0.0
+    prediction[..., 9] = 0.002
 
     metrics = compute_idle_rollout_metrics(target, prediction, idle_mask, horizon=4)
 
     assert metrics["val_active_left_translation_mae_mm"] == pytest.approx(0.15)
+    assert metrics["val_active_left_translation_bias_x_mm"] == pytest.approx(-0.15)
+    assert metrics["val_active_left_translation_bias_y_mm"] == pytest.approx(0.0)
+    assert metrics["val_active_left_translation_bias_z_mm"] == pytest.approx(0.0)
+    assert metrics["val_active_left_translation_p50_mm"] == pytest.approx(0.0)
+    assert metrics["val_active_left_translation_p95_mm"] == pytest.approx(0.51)
+    assert metrics["val_active_left_rotation_p50_deg"] == pytest.approx(0.0)
+    assert metrics["val_active_left_gripper_mae_mm"] == pytest.approx(2.0)
     assert metrics["val_micro_motion_recall"] == pytest.approx(0.75)
 
 
 @pytest.mark.parametrize(
-    ("active", "baseline", "recall", "feasible"),
-    [(1.05, 1.0, 0.95, True), (1.051, 1.0, 0.95, False), (1.0, 1.0, 0.949, False)],
+    ("translation", "rotation", "recall", "feasible"),
+    [
+        (1.05, 2.10, 0.95, True),
+        (1.051, 2.0, 0.95, False),
+        (1.0, 2.101, 0.95, False),
+        (1.0, 2.0, 0.949, False),
+    ],
 )
-def test_checkpoint_feasibility_enforces_active_and_micro_motion_limits(
-    active, baseline, recall, feasible
+def test_checkpoint_feasibility_enforces_separate_active_and_micro_motion_limits(
+    translation, rotation, recall, feasible
 ):
     result = evaluate_checkpoint_feasibility(
         idle_translation_29_mm=0.4,
         idle_rotation_29_deg=0.1,
-        active_metric=active,
-        active_baseline=baseline,
+        idle_translation_p95_mm=0.04,
+        idle_rotation_p95_deg=0.02,
+        active_translation_mm=translation,
+        active_translation_baseline_mm=1.0,
+        active_rotation_deg=rotation,
+        active_rotation_baseline_deg=2.0,
         micro_motion_recall=recall,
     )
 
-    assert result["val_active_degradation"] == pytest.approx(active / baseline - 1.0)
+    assert result["val_active_translation_degradation"] == pytest.approx(
+        translation / 1.0 - 1.0
+    )
+    assert result["val_active_rotation_degradation"] == pytest.approx(
+        rotation / 2.0 - 1.0
+    )
     assert result["val_idle_score"] == pytest.approx(0.6)
     assert result["val_checkpoint_feasible"] is feasible
     assert result["val_deployable"] is feasible
 
 
-def test_missing_active_baseline_is_not_deployable():
-    result = evaluate_checkpoint_feasibility(
-        idle_translation_29_mm=0.1,
-        idle_rotation_29_deg=0.1,
-        active_metric=0.0,
-        active_baseline=None,
-        micro_motion_recall=1.0,
+@pytest.mark.parametrize(
+    ("metric_name", "metric_value"),
+    [
+        ("idle_translation_29_mm", 1.0),
+        ("idle_rotation_29_deg", 0.5),
+        ("idle_translation_p95_mm", 0.05),
+        ("idle_rotation_p95_deg", 0.03),
+    ],
+)
+def test_deployable_enforces_strict_idle_release_limits(metric_name, metric_value):
+    values = {
+        "idle_translation_29_mm": 0.9,
+        "idle_rotation_29_deg": 0.4,
+        "idle_translation_p95_mm": 0.04,
+        "idle_rotation_p95_deg": 0.02,
+        "active_translation_mm": 1.0,
+        "active_translation_baseline_mm": 1.0,
+        "active_rotation_deg": 2.0,
+        "active_rotation_baseline_deg": 2.0,
+        "micro_motion_recall": 1.0,
+    }
+    values[metric_name] = metric_value
+
+    result = evaluate_checkpoint_feasibility(**values)
+
+    assert result["val_checkpoint_feasible"] is True
+    assert result["val_deployable"] is False
+
+
+def test_v2_baseline_json_is_required_and_keeps_units_separate(tmp_path):
+    config = OmegaConf.create(
+        {
+            "task": {"action_representation_version": 2},
+            "validation": {"baseline_json": None},
+        }
     )
 
-    assert result["val_checkpoint_feasible"] is False
-    assert result["val_deployable"] is False
+    with pytest.raises(ValueError, match="baseline_json"):
+        load_active_metric_baselines(config)
+
+    baseline_path = tmp_path / "frozen-v1.json"
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "val_active_left_translation_mae_mm": 1.25,
+                "val_active_left_rotation_mae_deg": 2.5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.validation.baseline_json = str(baseline_path)
+
+    assert load_active_metric_baselines(config) == {
+        "translation_mm": 1.25,
+        "rotation_deg": 2.5,
+    }
+
+
+def test_seeded_validation_is_repeatable_and_preserves_global_rng():
+    random.seed(101)
+    np.random.seed(102)
+    torch.manual_seed(103)
+    expected_after = (random.random(), np.random.rand(), torch.rand(3))
+
+    random.seed(101)
+    np.random.seed(102)
+    torch.manual_seed(103)
+    seeded_values = []
+    for _ in range(2):
+        with preserve_global_rng_state(7):
+            seeded_values.append((random.random(), np.random.rand(), torch.rand(3)))
+    actual_after = (random.random(), np.random.rand(), torch.rand(3))
+
+    assert seeded_values[0][0] == seeded_values[1][0]
+    assert seeded_values[0][1] == seeded_values[1][1]
+    torch.testing.assert_close(seeded_values[0][2], seeded_values[1][2], rtol=0, atol=0)
+    assert actual_after[0] == expected_after[0]
+    assert actual_after[1] == expected_after[1]
+    torch.testing.assert_close(actual_after[2], expected_after[2], rtol=0, atol=0)
+
+
+def test_contiguous_300_step_drift_requires_real_contiguous_actions():
+    target = _neutral_actions(horizon=300)
+    prediction = target.copy()
+    prediction[..., 10] = 1e-6
+    idle_mask = np.zeros((1, 300, 2), dtype=bool)
+    idle_mask[..., 1] = True
+
+    metrics = compute_contiguous_300_step_drift(target, prediction, idle_mask)
+
+    assert metrics["val_idle_translation_300_mm"] == pytest.approx(0.3)
+    with pytest.raises(ValueError, match="300 contiguous"):
+        compute_contiguous_300_step_drift(
+            target[:, :32], prediction[:, :32], idle_mask[:, :32]
+        )
 
 
 def test_resume_rejects_action_contract_version_mismatch():
@@ -145,6 +257,8 @@ def test_pick_tube_v2_configs_select_feasible_idle_score():
         assert cfg.checkpoint.topk.mode == "min"
         assert cfg.validation.max_active_degradation == 0.05
         assert cfg.validation.min_micro_motion_recall == 0.95
+        assert cfg.validation.baseline_json is None
+        assert list(cfg.validation.seeds) == list(range(20))
 
 
 def test_v2_experiment_launcher_uses_fresh_20_epoch_runs():
@@ -156,5 +270,7 @@ def test_v2_experiment_launcher_uses_fresh_20_epoch_runs():
 
     assert '"AT_EPOCHS=20"' in script
     assert '"LDP_EPOCHS=20"' in script
+    assert '"LDP_EPOCH=15"' not in script
     assert '"RESUME=false"' in script
     assert "pca%d_armwise_rdp_zarr_v2" in script
+    assert "BASELINE_JSON" in script
